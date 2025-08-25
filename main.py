@@ -1,19 +1,22 @@
 # -*- coding: utf-8 -*-
 """
 API Flask para Sistema de Trading de Criptomoedas com IA + Alertas Telegram
-- TP/SL por ATR (configurável) com fallback por porcentagem
-- Anti-duplicação de alertas por assinatura (lado+entry+tp+sl) + cooldown
-- Comentário técnico (tendência, MACD, ATR%, 24h, R:R) estilo profissional
+- TP/SL por ATR (config.) com fallback por porcentagem
+- Validação de coerência TP/SL (compra: TP>entry & SL<entry | venda: TP<entry & SL>entry)
+- Anti-duplicação (lado+entry+tp+sl) + cooldown + no máximo 1 alerta por símbolo por ciclo
+- Comentário técnico (tendência, MACD, ATR%, 24h, R:R)
+- Endpoint /api/test-ai para diagnóstico
+- Dashboard dark
 """
 import os, sys, time, json, threading, requests
 from math import isnan
 from datetime import datetime, timedelta
-from typing import List, Dict, Any, Tuple
-from flask import Flask, jsonify, render_template_string
+from typing import List, Dict, Any, Tuple, Set
+from flask import Flask, jsonify, render_template_string, request
 from flask_cors import CORS
 
 # ----------------- Config por ENV -----------------
-ALERT_CONF_MIN        = float(os.environ.get("ALERT_CONF_MIN", "0.60"))       # confiança mínima p/ alertar (0–1)
+ALERT_CONF_MIN        = float(os.environ.get("ALERT_CONF_MIN", "0.60"))       # confiança mínima (0–1)
 ALERT_COOLDOWN_MIN    = int(os.environ.get("ALERT_COOLDOWN_MIN", "30"))       # silêncio por símbolo (min)
 UPDATE_INTERVAL_SEC   = int(os.environ.get("UPDATE_INTERVAL_SECONDS", "300")) # ciclo (s)
 
@@ -117,7 +120,6 @@ def macd(values: List[float], fast=12, slow=26, signal=9) -> Tuple[List[float], 
     if len(values) < slow + signal: return [], []
     ema_fast = ema(values, fast)
     ema_slow = ema(values, slow)
-    # alinhar tamanhos
     offs = len(ema_fast) - len(ema_slow)
     if offs > 0: ema_fast = ema_fast[offs:]
     elif offs < 0: ema_slow = ema_slow[-offs:]
@@ -156,6 +158,25 @@ def price_levels_by_atr(side: str, price: float, atr: float,
         sl = price + sl_mult * atr
     return tp, sl
 
+def enforce_coherence(side: str, entry: float, tp: float, sl: float) -> Tuple[float, float]:
+    """
+    Garante consistência:
+      - COMPRA: tp > entry e sl < entry
+      - VENDA : tp < entry e sl > entry
+    Se necessário, troca tp <-> sl e faz pequenos ajustes pelo fallback %.
+    """
+    if side == "COMPRA":
+        if tp <= entry and sl >= entry:
+            tp, sl = sl, tp
+        if tp <= entry: tp = entry * (1 + max(TP_PCT, 0.001))
+        if sl >= entry: sl = entry * (1 - max(SL_PCT, 0.001))
+    else:
+        if tp >= entry and sl <= entry:
+            tp, sl = sl, tp
+        if tp >= entry: tp = entry * (1 - max(TP_PCT, 0.001))
+        if sl <= entry: sl = entry * (1 + max(SL_PCT, 0.001))
+    return tp, sl
+
 # ----------------- IA -----------------
 def load_ai_model():
     global model, scaler
@@ -178,6 +199,7 @@ def collect_and_predict():
         print("🔄 Coletando dados e fazendo predições...")
         bulk_data = fetch_bulk_prices(SYMBOLS)  # preços, mcap, 24h
         predictions: List[Dict[str, Any]] = []
+        sent_this_cycle: Set[str] = set()  # garante 1 alerta por símbolo por ciclo
 
         for symbol in SYMBOLS:
             try:
@@ -186,7 +208,7 @@ def collect_and_predict():
                 if not ohlc_raw or len(ohlc_raw) < 60:
                     continue
 
-                # normaliza para predict_signal
+                # normaliza para predict_signal + prepara closes para métricas
                 candles_norm = []
                 closes = []
                 for ts, o, h, l, c in ohlc_raw:
@@ -223,13 +245,13 @@ def collect_and_predict():
                      (side == "VENDA"  and prob_sell >= ALERT_CONF_MIN))
                 )
 
-                if trigger:
+                if trigger and symbol not in sent_this_cycle:
                     now = datetime.utcnow()
                     last_t = _last_alert_time.get(symbol)
 
                     entry = price_now
                     # ——— níveis por ATR (ou % fallback) ———
-                    tp, sl, rr = None, None, None
+                    tp, sl = None, None
                     atr = None
                     if USE_ATR_LEVELS:
                         atr = compute_atr(ohlc_raw, ATR_PERIOD)
@@ -243,6 +265,10 @@ def collect_and_predict():
                             tp = entry * (1 - TP_PCT)
                             sl = entry * (1 + SL_PCT)
 
+                    # --------- Validação de coerência ---------
+                    tp, sl = enforce_coherence(side, entry, tp, sl)
+
+                    # --------- Métrica R:R ---------
                     if side == "COMPRA":
                         rr = (tp - entry) / max(entry - sl, 1e-12)
                     else:
@@ -251,12 +277,11 @@ def collect_and_predict():
                     # --------- Anti-duplicação ---------
                     sig = (side, round(entry,6), round(tp,6), round(sl,6))
                     last_sig = _last_alert_sig.get(symbol)
-                    skip_dup = (last_sig == sig) and last_t and ((now - last_t) < timedelta(minutes=ALERT_COOLDOWN_MIN))
-                    if skip_dup:
-                        # já avisamos esse mesmo setup recentemente
-                        pass
-                    else:
+                    cooldown_ok = (not last_t) or ((now - last_t) >= timedelta(minutes=ALERT_COOLDOWN_MIN))
+                    is_dup = (last_sig == sig)
+                    if cooldown_ok and not is_dup:
                         _last_alert_sig[symbol] = sig
+                        sent_this_cycle.add(symbol)
 
                         # --------- Comentário profissional ---------
                         trend_txt = "Neutra"
@@ -268,12 +293,15 @@ def collect_and_predict():
                             elif atr_pct < 3.0: vol_txt = "Média"
                             else: vol_txt = "Alta"
 
-                        sma20 = sma(closes, 20)
-                        sma50 = sma(closes, 50)
+                        def _sma(vals, n):
+                            return sma(vals, n)[-1] if len(vals) >= n else None
+
+                        sma20_last = _sma(closes, 20)
+                        sma50_last = _sma(closes, 50)
                         macd_line, macd_sig = macd(closes, 12, 26, 9)
-                        if sma20 and sma50:
-                            if sma20[-1] > sma50[-1]: trend_txt = "Alta"
-                            elif sma20[-1] < sma50[-1]: trend_txt = "Baixa"
+                        if sma20_last is not None and sma50_last is not None:
+                            if sma20_last > sma50_last: trend_txt = "Alta"
+                            elif sma20_last < sma50_last: trend_txt = "Baixa"
                         macd_txt = "—"
                         if macd_line and macd_sig:
                             macd_txt = "Alta" if macd_line[-1] > macd_sig[-1] else "Baixa"
@@ -294,7 +322,7 @@ def collect_and_predict():
                             "probability_buy": prob_buy,
                             "probability_sell": prob_sell,
                             "price_change_24h": pct24,
-                            "rr": round(rr, 2) if rr == rr else None,
+                            "rr": round(rr, 2),
                             "atr": round(atr, 6) if atr else None,
                             "atr_pct": round(atr_pct, 2) if atr_pct else None,
                             "trend": trend_txt,
@@ -307,7 +335,7 @@ def collect_and_predict():
                             f"📢 Novo sinal para {symbol}\n"
                             f"🎯 Entrada: {content['entry_price']}\n"
                             f"🎯 Alvo:   {content['tp']}   • 🛑 Stop: {content['sl']}\n"
-                            f"📈 Confiança: {conf*100:.0f}% • R:R {content['rr'] if content['rr'] is not None else '—'}\n"
+                            f"📈 Confiança: {conf*100:.0f}% • R:R {content['rr']}\n"
                             f"🧠 Estratégia: {STRATEGY_LABEL} {'(ATR)' if USE_ATR_LEVELS else '(%)'}\n"
                             f"📊 Tendência: {trend_txt} • MACD: {macd_txt} • Vol: {vol_txt}"
                             + (f" ({content['atr_pct']}%)" if content.get('atr_pct') is not None else "")
@@ -449,6 +477,7 @@ pullStatus(); pull(); setInterval(()=>{ pullStatus(); pull(); }, 60000);
 """
     return render_template_string(html)
 
+# ----------------- API: dados -----------------
 @app.route("/api/predictions")
 def get_predictions():
     global predictions_cache, last_update
@@ -484,10 +513,55 @@ def force_update():
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
+@app.route("/api/test-ai")
+def test_ai():
+    """
+    Diagnóstico: roda a IA ao vivo num símbolo (padrão BTCUSDT), sem cache e sem Telegram.
+    Params: symbol (ex.: DOTUSDT), days (ex.: 14)
+    """
+    try:
+        symbol = (request.args.get("symbol") or "BTCUSDT").upper().strip()
+        days = int(request.args.get("days") or 30)
+
+        coin_id = SYMBOL_TO_ID.get(symbol, symbol.replace("USDT", "").lower())
+        ohlc_raw = fetch_ohlc(coin_id, days=days)
+        if not ohlc_raw or len(ohlc_raw) < 20:
+            return jsonify({"success": False, "error": f"OHLC insuficiente para {symbol} (days={days})", "symbol": symbol}), 400
+
+        candles = []
+        for ts, o, h, l, c in ohlc_raw:
+            candles.append({
+                "timestamp": int(ts/1000),
+                "open": float(o), "high": float(h),
+                "low": float(l), "close": float(c)
+            })
+
+        result, error = predict_signal(symbol, candles)
+        price_ctx = fetch_bulk_prices([symbol]).get(symbol, {})
+        now_iso = datetime.utcnow().isoformat() + "Z"
+
+        return jsonify({
+            "success": True if result else False,
+            "model_loaded": (model is not None),
+            "symbol": symbol,
+            "days": days,
+            "timestamp": now_iso,
+            "prediction": result,
+            "error": error,
+            "context": {
+                "current_price": price_ctx.get("usd"),
+                "price_change_24h": price_ctx.get("usd_24hr_change") or price_ctx.get("usd_24h_change"),
+                "market_cap": price_ctx.get("usd_market_cap")
+            }
+        }), (200 if result else 500)
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
 @app.route("/health")
 def health():
     return jsonify(ok=True, model_loaded=(model is not None)), 200
 
+# ----------------- Boot -----------------
 if __name__ == "__main__":
     print("🚀 Iniciando Crypto Trading API...")
     load_ai_model()
