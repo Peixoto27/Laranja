@@ -2,6 +2,8 @@
 """
 API Flask para Sistema de Trading de Criptomoedas com IA + Alertas Telegram
 - TP/SL por ATR (configurável) com fallback por porcentagem
+- Anti-duplicação de alertas por assinatura (lado+entry+tp+sl) + cooldown
+- Comentário técnico (tendência, MACD, ATR%, 24h, R:R) estilo profissional
 """
 import os, sys, time, json, threading, requests
 from math import isnan
@@ -86,47 +88,70 @@ predictions_cache: List[Dict[str, Any]] = []
 last_update: datetime | None = None
 model = None
 scaler = None
-_last_alert_time: Dict[str, datetime] = {}  # {symbol: datetime}
+_last_alert_time: Dict[str, datetime] = {}    # {symbol: datetime}
+_last_alert_sig:  Dict[str, Tuple] = {}       # {symbol: (side, entry, tp, sl)}  -> evita duplicar
 
-# ----------------- Utils: ATR -----------------
+# ----------------- Utils: médias, MACD, ATR -----------------
+def ema(values: List[float], period: int) -> List[float]:
+    if len(values) < period: return []
+    k = 2 / (period + 1)
+    out = []
+    s = sum(values[:period]) / period
+    out.append(s)
+    for v in values[period:]:
+        s = v * k + s * (1 - k)
+        out.append(s)
+    return out
+
+def sma(values: List[float], period: int) -> List[float]:
+    if len(values) < period: return []
+    out = []
+    s = sum(values[:period])
+    out.append(s / period)
+    for i in range(period, len(values)):
+        s += values[i] - values[i - period]
+        out.append(s / period)
+    return out
+
+def macd(values: List[float], fast=12, slow=26, signal=9) -> Tuple[List[float], List[float]]:
+    if len(values) < slow + signal: return [], []
+    ema_fast = ema(values, fast)
+    ema_slow = ema(values, slow)
+    # alinhar tamanhos
+    offs = len(ema_fast) - len(ema_slow)
+    if offs > 0: ema_fast = ema_fast[offs:]
+    elif offs < 0: ema_slow = ema_slow[-offs:]
+    line = [a - b for a, b in zip(ema_fast, ema_slow)]
+    sig = ema(line, signal)
+    offs2 = len(line) - len(sig)
+    if offs2 > 0: line = line[offs2:]
+    return line, sig
+
 def _wilder_ema(prev: float, value: float, period: int) -> float:
-    """Wilder EMA para ATR."""
     return (prev * (period - 1) + value) / period
 
 def compute_atr(candles: List[List[float]], period: int = 14) -> float | None:
-    """
-    candles: [[ts, open, high, low, close], ...] (como o CoinGecko retorna)
-    retorna ATR (float) ou None se não puder calcular
-    """
     n = len(candles)
-    if n < period + 1:
-        return None
+    if n < period + 1: return None
     trs: List[float] = []
     for i in range(1, n):
         _, o, h, l, c = candles[i]
         _, po, ph, pl, pc = candles[i - 1]
         tr = max(h - l, abs(h - pc), abs(l - pc))
         trs.append(float(tr))
-    if len(trs) < period:
-        return None
-    # média inicial
+    if len(trs) < period: return None
     atr = sum(trs[:period]) / period
-    # suavização de Wilder
     for tr in trs[period:]:
         atr = _wilder_ema(atr, tr, period)
-    if atr is None or isnan(atr):
-        return None
+    if atr is None or isnan(atr): return None
     return float(atr)
 
 def price_levels_by_atr(side: str, price: float, atr: float,
                         tp_mult: float, sl_mult: float) -> Tuple[float, float]:
-    """
-    Retorna (tp, sl) a partir do preço e ATR.
-    """
     if side == "COMPRA":
         tp = price + tp_mult * atr
         sl = price - sl_mult * atr
-    else:  # VENDA
+    else:
         tp = price - tp_mult * atr
         sl = price + sl_mult * atr
     return tp, sl
@@ -163,12 +188,14 @@ def collect_and_predict():
 
                 # normaliza para predict_signal
                 candles_norm = []
+                closes = []
                 for ts, o, h, l, c in ohlc_raw:
                     candles_norm.append({
                         "timestamp": int(ts/1000),
                         "open": float(o), "high": float(h),
                         "low": float(l), "close": float(c)
                     })
+                    closes.append(float(c))
 
                 result, error = predict_signal(symbol, candles_norm)
                 if not result:
@@ -198,29 +225,58 @@ def collect_and_predict():
 
                 if trigger:
                     now = datetime.utcnow()
-                    last = _last_alert_time.get(symbol)
-                    if (not last) or ((now - last) >= timedelta(minutes=ALERT_COOLDOWN_MIN)):
-                        entry = price_now
+                    last_t = _last_alert_time.get(symbol)
 
-                        # ——— níveis por ATR (ou % fallback) ———
-                        tp, sl, rr = None, None, None
-                        if USE_ATR_LEVELS:
-                            atr = compute_atr(ohlc_raw, ATR_PERIOD)
-                            if atr:
-                                tp, sl = price_levels_by_atr(side, entry, atr, TP_ATR_MULT, SL_ATR_MULT)
-                        if tp is None or sl is None:
-                            # fallback por porcentagem
-                            if side == "COMPRA":
-                                tp = entry * (1 + TP_PCT)
-                                sl = entry * (1 - SL_PCT)
-                            else:
-                                tp = entry * (1 - TP_PCT)
-                                sl = entry * (1 + SL_PCT)
-
+                    entry = price_now
+                    # ——— níveis por ATR (ou % fallback) ———
+                    tp, sl, rr = None, None, None
+                    atr = None
+                    if USE_ATR_LEVELS:
+                        atr = compute_atr(ohlc_raw, ATR_PERIOD)
+                        if atr:
+                            tp, sl = price_levels_by_atr(side, entry, atr, TP_ATR_MULT, SL_ATR_MULT)
+                    if tp is None or sl is None:
                         if side == "COMPRA":
-                            rr = (tp - entry) / max(entry - sl, 1e-12)
+                            tp = entry * (1 + TP_PCT)
+                            sl = entry * (1 - SL_PCT)
                         else:
-                            rr = (entry - tp) / max(sl - entry, 1e-12)
+                            tp = entry * (1 - TP_PCT)
+                            sl = entry * (1 + SL_PCT)
+
+                    if side == "COMPRA":
+                        rr = (tp - entry) / max(entry - sl, 1e-12)
+                    else:
+                        rr = (entry - tp) / max(sl - entry, 1e-12)
+
+                    # --------- Anti-duplicação ---------
+                    sig = (side, round(entry,6), round(tp,6), round(sl,6))
+                    last_sig = _last_alert_sig.get(symbol)
+                    skip_dup = (last_sig == sig) and last_t and ((now - last_t) < timedelta(minutes=ALERT_COOLDOWN_MIN))
+                    if skip_dup:
+                        # já avisamos esse mesmo setup recentemente
+                        pass
+                    else:
+                        _last_alert_sig[symbol] = sig
+
+                        # --------- Comentário profissional ---------
+                        trend_txt = "Neutra"
+                        vol_txt = "—"
+                        atr_pct = None
+                        if atr and entry > 0:
+                            atr_pct = (atr / entry) * 100.0
+                            if atr_pct < 1.5: vol_txt = "Baixa"
+                            elif atr_pct < 3.0: vol_txt = "Média"
+                            else: vol_txt = "Alta"
+
+                        sma20 = sma(closes, 20)
+                        sma50 = sma(closes, 50)
+                        macd_line, macd_sig = macd(closes, 12, 26, 9)
+                        if sma20 and sma50:
+                            if sma20[-1] > sma50[-1]: trend_txt = "Alta"
+                            elif sma20[-1] < sma50[-1]: trend_txt = "Baixa"
+                        macd_txt = "—"
+                        if macd_line and macd_sig:
+                            macd_txt = "Alta" if macd_line[-1] > macd_sig[-1] else "Baixa"
 
                         content = {
                             "symbol": symbol,
@@ -238,19 +294,25 @@ def collect_and_predict():
                             "probability_buy": prob_buy,
                             "probability_sell": prob_sell,
                             "price_change_24h": pct24,
-                            "rr": round(rr, 2) if rr == rr else None,  # evita NaN
+                            "rr": round(rr, 2) if rr == rr else None,
+                            "atr": round(atr, 6) if atr else None,
+                            "atr_pct": round(atr_pct, 2) if atr_pct else None,
+                            "trend": trend_txt,
+                            "macd_trend": macd_txt,
+                            "volatility": vol_txt,
                             "timestamp": now.isoformat() + "Z"
                         }
 
                         txt = (
                             f"📢 Novo sinal para {symbol}\n"
                             f"🎯 Entrada: {content['entry_price']}\n"
-                            f"🎯 Alvo:   {content['tp']}\n"
-                            f"🛑 Stop:   {content['sl']}\n"
-                            f"📈 Confiança: {conf*100:.0f}%\n"
-                            f"🧠 Estratégia: {STRATEGY_LABEL} "
-                            f"{'(ATR)' if USE_ATR_LEVELS else '(%)'}\n"
-                            f"⏱️ {TIMEFRAME} • RR: {content['rr'] if content['rr'] is not None else '—'}"
+                            f"🎯 Alvo:   {content['tp']}   • 🛑 Stop: {content['sl']}\n"
+                            f"📈 Confiança: {conf*100:.0f}% • R:R {content['rr'] if content['rr'] is not None else '—'}\n"
+                            f"🧠 Estratégia: {STRATEGY_LABEL} {'(ATR)' if USE_ATR_LEVELS else '(%)'}\n"
+                            f"📊 Tendência: {trend_txt} • MACD: {macd_txt} • Vol: {vol_txt}"
+                            + (f" ({content['atr_pct']}%)" if content.get('atr_pct') is not None else "")
+                            + f" • 24h: {pct24:+.2f}%\n"
+                            f"⏱️ {TIMEFRAME}"
                         )
                         notify_telegram_message(txt, payload=content)
                         _last_alert_time[symbol] = now
