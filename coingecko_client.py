@@ -1,14 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 Cliente CoinGecko com retry/backoff e chamadas em lote para evitar 429.
-- fetch_bulk_prices: busca preços/24h em batches (default 5) com retry e jitter
-- fetch_ohlc: busca OHLC com retry e respeito a Retry-After (se presente)
+- fetch_bulk_prices: preços/24h em batches (default 5) com retry e jitter
+- fetch_ohlc: OHLC com retry e respeito a Retry-After
 
-Requer em config.py (ou usa defaults se não existir):
-  API_DELAY_BULK (float)     - atraso entre batches de /simple/price
-  API_DELAY_OHLC (float)     - atraso entre tentativas do OHLC
-  MAX_RETRIES (int)          - tentativas por request
-  BACKOFF_BASE (float)       - fator de backoff exponencial
+Leitura de configs opcionais de config.py:
+  API_DELAY_BULK, API_DELAY_OHLC, MAX_RETRIES, BACKOFF_BASE
 """
 
 from __future__ import annotations
@@ -17,17 +14,16 @@ import random
 import requests
 from typing import List, Dict, Any
 
-# ---- Config ----
+# ---- Config (com defaults) ----
 try:
     from config import API_DELAY_BULK, API_DELAY_OHLC, MAX_RETRIES, BACKOFF_BASE
 except Exception:
-    # valores seguros por padrão
-    API_DELAY_BULK = 1.5       # s entre batches do /simple/price
-    API_DELAY_OHLC = 1.5       # s entre tentativas de OHLC
+    API_DELAY_BULK = 1.5
+    API_DELAY_OHLC = 1.5
     MAX_RETRIES = 5
     BACKOFF_BASE = 1.8
 
-# ---- Mapeia tickers (ex.: BTCUSDT) -> IDs do CoinGecko ----
+# ---- Mapa TICKER -> CoinGecko ID ----
 SYMBOL_TO_ID: Dict[str, str] = {
     "BTCUSDT": "bitcoin",
     "ETHUSDT": "ethereum",
@@ -75,31 +71,26 @@ SYMBOL_TO_ID: Dict[str, str] = {
 
 API_BASE = "https://api.coingecko.com/api/v3"
 
-# Sessão HTTP com UA estável
 session = requests.Session()
 session.headers.update({"User-Agent": "CryptonSignals/1.0 (Railway)"})
 
 
-# ---- Helpers ----
 def _to_cg_id(sym_or_id: str) -> str:
-    """Converte TICKER (ex.: BTCUSDT) para ID do CoinGecko, quando possível."""
     if not sym_or_id:
         return ""
     s = sym_or_id.strip().upper()
     if s in SYMBOL_TO_ID:
         return SYMBOL_TO_ID[s]
-    # fallback: remove sufixo USDT/USDC e usa minúsculas
     if s.endswith("USDT") or s.endswith("USDC"):
         s = s[:-4]
     return s.lower()
 
 
-# ---- API: Simple Price (em lote, com retry/backoff) ----
 def fetch_bulk_prices(symbols: List[str], batch_size: int = 5) -> Dict[str, Any]:
     """
     Busca preços e variação 24h para uma lista de símbolos.
-    Faz chamadas em lotes de 'batch_size' (default 5) para evitar 429.
-    Retorno: dict onde as chaves são os TICKERS originais.
+    Faz chamadas em lotes de 'batch_size' (default 5) com retry/backoff.
+    Retorna dict usando TICKERS originais como chaves.
     """
     out: Dict[str, Any] = {}
     if not symbols:
@@ -115,22 +106,18 @@ def fetch_bulk_prices(symbols: List[str], batch_size: int = 5) -> Dict[str, Any]
         delay = API_DELAY_BULK
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                # pequeno delay antes de cada chamada
                 time.sleep(delay)
                 resp = session.get(url, params=params, timeout=20)
 
                 if resp.status_code == 200:
                     data = resp.json()
-                    # re-mapeia data pelo TICKER original
                     for s in batch:
                         cid = _to_cg_id(s)
                         if cid in data:
                             out[s] = data[cid]
-                    # jitter pós-sucesso para reduzir thundering herd
                     time.sleep(API_DELAY_BULK + random.uniform(0.4, 1.2))
                     break
 
-                # 429: Too Many Requests — respeita Retry-After se existir
                 if resp.status_code == 429:
                     retry_after = resp.headers.get("Retry-After")
                     wait = float(retry_after) if retry_after else delay
@@ -141,7 +128,6 @@ def fetch_bulk_prices(symbols: List[str], batch_size: int = 5) -> Dict[str, Any]
                     delay = min(delay * BACKOFF_BASE, 60.0)
                     continue
 
-                # 5xx: backoff e tenta de novo
                 if 500 <= resp.status_code < 600:
                     wait = delay + random.uniform(0.8, 2.0)
                     print(f"⚠️ {resp.status_code} PRICE ids={ids[:60]}... aguardando {round(wait,1)}s")
@@ -149,7 +135,6 @@ def fetch_bulk_prices(symbols: List[str], batch_size: int = 5) -> Dict[str, Any]
                     delay = min(delay * BACKOFF_BASE, 60.0)
                     continue
 
-                # outros erros: levanta
                 resp.raise_for_status()
 
             except requests.RequestException as e:
@@ -159,18 +144,15 @@ def fetch_bulk_prices(symbols: List[str], batch_size: int = 5) -> Dict[str, Any]
                 time.sleep(wait)
                 delay = min(delay * BACKOFF_BASE, 60.0)
         else:
-            # esgotou tentativas para esse lote
             print(f"⛔ Falha PRICE ids={ids[:60]}... após {MAX_RETRIES} tentativas; seguindo.")
 
     return out
 
 
-# ---- API: OHLC (com retry/backoff) ----
 def fetch_ohlc(sym_or_id: str, days: int = 1) -> list:
     """
-    Busca OHLC com retry/backoff e respeito ao Retry-After.
-    Aceita TICKER (ex.: BTCUSDT) ou ID do CG (ex.: bitcoin).
-    Retorna lista no formato do CG: [[ts, open, high, low, close], ...]
+    Busca OHLC com retry/backoff. Aceita TICKER (ex.: BTCUSDT) ou ID (ex.: bitcoin).
+    Retorna lista: [[ts, open, high, low, close], ...]
     """
     coin_id = _to_cg_id(sym_or_id)
     url = f"{API_BASE}/coins/{coin_id}/ohlc"
@@ -211,5 +193,4 @@ def fetch_ohlc(sym_or_id: str, days: int = 1) -> list:
             time.sleep(wait)
             delay = min(delay * BACKOFF_BASE, 60.0)
 
-    # esgotou tentativas
     return []
