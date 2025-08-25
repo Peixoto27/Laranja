@@ -23,6 +23,21 @@ SYMBOL_TO_ID: Dict[str, str] = {
     "DOTUSDT": "polkadot",
     "LTCUSDT": "litecoin",
     "LINKUSDT": "chainlink",
+    "ADAUSDT":  "cardano",
+    "TRXUSDT":  "tron",
+    "SHIBUSDT": "shiba-inu",
+    "AVAXUSDT": "avalanche-2",
+    "TONUSDT":  "toncoin",
+    "NEARUSDT": "near",
+    "APTUSDT":  "aptos",
+    "OPUSDT":   "optimism",
+    "ARBUSDT":  "arbitrum",
+    "ATOMUSDT": "cosmos",
+    "SUIUSDT":  "sui",
+    "PEPEUSDT": "pepe",
+    "FTMUSDT":  "fantom",
+    "ICPUSDT":  "internet-computer",
+    "ETCUSDT":  "ethereum-classic",
 }
 
 def _get_json(url: str, params: dict | None = None, retries: int = 6, base_delay: float = 0.8):
