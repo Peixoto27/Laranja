@@ -1,145 +1,213 @@
 # -*- coding: utf-8 -*-
-import os, json, time
+"""
+API Flask para Sistema de Trading de Criptomoedas com IA
+"""
+import os
+import sys
+from flask import Flask, jsonify, render_template_string
+from flask_cors import CORS
+import json
+import numpy as np
 from datetime import datetime
+import threading
+import time
 
-from config import (
-    MIN_CONFIDENCE, DEBUG_SCORE, TOP_SYMBOLS,
-    BATCH_OHLC, BATCH_PAUSE_SEC, SYMBOLS,
-    DATA_RAW_FILE, SIGNALS_FILE, OHLC_DAYS,
-    COOLDOWN_HOURS, CHANGE_THRESHOLD_PCT,
-    USE_AI, AI_THRESHOLD
-)
-from coingecko_client import fetch_bulk_prices, fetch_ohlc, SYMBOL_TO_ID
-from apply_strategies import generate_signal, score_signal
-from notifier_telegram import send_signal_notification
-from positions_manager import should_send_and_register
+# Adicionar diretório atual ao path para imports
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-# IA
-from indicators import rsi, macd, ema, bollinger
-from ai_predictor import load_model, predict_proba, log_if_active
+# Imports do projeto
+try:
+    from predict_enhanced import predict_signal, load_model_and_scaler
+    from coingecko_client import fetch_bulk_prices, fetch_ohlc, SYMBOL_TO_ID
+    from config import SYMBOLS
+except ImportError as e:
+    print(f"Erro ao importar módulos: {e}")
 
-def log(msg): print(msg, flush=True)
-def chunks(lst, n):
-    for i in range(0, len(lst), n):
-        yield lst[i:i+n]
+app = Flask(__name__)
+CORS(app)  # Permitir CORS para todas as rotas
 
-def build_features(closes):
-    if not closes or len(closes) < 60:
-        return None, None
-    R = rsi(closes, 14); M, S, H = macd(closes, 12, 26, 9)
-    E20 = ema(closes, 20); E50 = ema(closes, 50)
-    Bup, Bmid, Blow = bollinger(closes, 20, 2.0)
-    i = len(closes) - 1
-    vals = [R[i], M[i], S[i], H[i], E20[i], E50[i], Bup[i], Bmid[i], Blow[i]]
-    if any(v is None for v in vals): return None, None
-    sc = score_signal(closes)
-    sc_val = sc[0] if isinstance(sc, tuple) else sc
-    if sc_val is None: return None, None
-    feats = [float(v) for v in vals] + [float(sc_val)]
-    return feats, sc_val
+# Variáveis globais
+predictions_cache = {}
+last_update = None
+model = None
+scaler = None
 
-def run_pipeline():
-    # IA: carregar e avisar se ativa
-    model = load_model() if USE_AI else None
-    if model is not None:
-        log_if_active(AI_THRESHOLD)
 
-    log("🧩 Coletando PREÇOS em lote (bulk)…")
-    bulk = fetch_bulk_prices(SYMBOLS)
-
-    ranked = []
-    for s in SYMBOLS:
-        info = bulk.get(s)
-        if not info: continue
-        ranked.append((s, abs(float(info.get("usd_24h_change", 0.0)))))
-    ranked.sort(key=lambda t: t[1], reverse=True)
-    selected = [sym for sym, _ in ranked[:max(1, int(TOP_SYMBOLS))]]
-    log(f"✅ Selecionados para OHLC: {', '.join(selected)}")
-
-    all_data = []
-    for idx, block in enumerate(chunks(selected, max(1, int(BATCH_OHLC)))):
-        if idx > 0:
-            log(f"⏸️ Pausa de {BATCH_PAUSE_SEC}s entre blocos…"); time.sleep(BATCH_PAUSE_SEC)
-        for s in block:
-            cid = SYMBOL_TO_ID.get(s, s.replace("USDT","").lower())
-            log(f"📊 Coletando OHLC {s} (days={OHLC_DAYS})…")
-            data = fetch_ohlc(cid, days=OHLC_DAYS)
-            if not data:
-                log(f"   → ❌ Dados insuficientes para {s}"); continue
-            candles = [{"timestamp": int(ts/1000), "open": float(o), "high": float(h),
-                        "low": float(l), "close": float(c)} for ts,o,h,l,c in data]
-            all_data.append({"symbol": s, "ohlc": candles})
-            log(f"   → OK | candles={len(candles)}")
-
-    with open(DATA_RAW_FILE, "w") as f: json.dump(all_data, f, indent=2)
-    log(f"💾 Salvo {DATA_RAW_FILE} ({len(all_data)} ativos)")
-
-    thr = MIN_CONFIDENCE if MIN_CONFIDENCE <= 1 else MIN_CONFIDENCE/100.0
-    approved = []
-
-    for item in all_data:
-        s = item["symbol"]; closes = [c["close"] for c in item["ohlc"]]
-
-        # Camada técnica
-        sig = generate_signal(s, item["ohlc"])
-        if not sig:
-            if DEBUG_SCORE:
-                sc = score_signal(closes)
-                shown = "None" if sc is None else f"{round((sc[0] if isinstance(sc, tuple) else sc)*100,1)}%"
-                log(f"ℹ️ Score {s}: {shown} (min {int(thr*100)}%)")
-            else:
-                log(f"⛔ {s} descartado (<{int(thr*100)}%)")
-            continue
-
-        # IA (opcional)
-        ai_ok, ai_proba = True, None
+def load_ai_model():
+    """Carrega o modelo de IA"""
+    global model, scaler
+    try:
+        model, scaler = load_model_and_scaler()
         if model is not None:
-            feats, _sc = build_features(closes)
-            if feats is not None:
-                ai_proba = predict_proba(model, feats)
-                if ai_proba is not None:
-                    ai_ok = (ai_proba >= AI_THRESHOLD)
+            print("✅ Modelo de IA carregado com sucesso")
+            return True
+        else:
+            print("❌ Falha ao carregar modelo de IA")
+            return False
+    except Exception as e:
+        print(f"❌ Erro ao carregar modelo: {e}")
+        return False
 
-        # Decisão final
-        if sig["confidence"] >= thr and ai_ok:
-            # anti-duplicado / cooldown / mudança relevante
-            ok_to_send, why = should_send_and_register(
-                sig,
-                cooldown_hours=COOLDOWN_HOURS,
-                change_threshold_pct=CHANGE_THRESHOLD_PCT
-            )
-            if not ok_to_send:
-                log(f"⏭️ {s} pulado (duplicado: {why}).")
+
+def collect_and_predict():
+    """Coleta dados e faz predições"""
+    global predictions_cache, last_update
+
+    try:
+        print("🔄 Coletando dados e fazendo predições...")
+        bulk_data = fetch_bulk_prices(SYMBOLS)
+        predictions = []
+
+        for symbol in SYMBOLS:
+            try:
+                coin_id = SYMBOL_TO_ID.get(symbol, symbol.replace("USDT", "").lower())
+                ohlc_data = fetch_ohlc(coin_id, days=30)
+                if not ohlc_data or len(ohlc_data) < 60:
+                    continue
+
+                candles = []
+                for ts, o, h, l, c in ohlc_data:
+                    candles.append({
+                        "timestamp": int(ts/1000),
+                        "open": float(o),
+                        "high": float(h),
+                        "low": float(l),
+                        "close": float(c)
+                    })
+
+                result, error = predict_signal(symbol, candles)
+                if result:
+                    current_data = bulk_data.get(symbol, {})
+                    result.update({
+                        'current_price': current_data.get('usd', 0),
+                        'price_change_24h': current_data.get('usd_24h_change', 0),
+                        'market_cap': current_data.get('usd_market_cap', 0)
+                    })
+                    predictions.append(result)
+            except Exception as e:
+                print(f"❌ Erro ao processar {symbol}: {e}")
                 continue
 
-            approved.append(sig)
-            proba_txt = f" | IA={round(ai_proba*100,1)}%" if ai_proba is not None else ""
-            prefix = "🧠 [AI] " if ai_proba is not None else ""
-            log(f"✅ {prefix}{s} aprovado ({int(sig['confidence']*100)}%{proba_txt})")
+        predictions_cache = predictions
+        last_update = datetime.now()
+        print(f"✅ Predições atualizadas: {len(predictions)} símbolos")
 
-            wire = {
-                "symbol": s,
-                "entry_price": sig["entry"],
-                "target_price": sig["tp"],
-                "stop_loss": sig["sl"],
-                "risk_reward": sig.get("risk_reward"),
-                "confidence_score": round(sig["confidence"]*100, 2),
-                "strategy": sig.get("strategy","RSI+MACD+EMA+BB") + ("+AI" if ai_proba is not None else ""),
-                "created_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
-                "id": f"{s}-{int(time.time())}",
-                "ai": True if ai_proba is not None else False,
-                "ai_proba": round(ai_proba*100,1) if ai_proba is not None else None
-            }
-            send_signal_notification(wire)
-        else:
-            why = []
-            if sig["confidence"] < thr: why.append("técnico")
-            if model is not None and ai_proba is not None and not ai_ok: why.append(f"IA<{int(AI_THRESHOLD*100)}% ({round(ai_proba*100,1)}%)")
-            log(f"⛔ {s} reprovado: {', '.join(why) if why else 'score baixo'}")
+    except Exception as e:
+        print(f"❌ Erro na coleta de dados: {e}")
 
-    with open(SIGNALS_FILE, "w") as f: json.dump(approved, f, indent=2)
-    log(f"💾 {len(approved)} sinais salvos em {SIGNALS_FILE}")
-    log(f"🕒 Fim: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC")
 
-if __name__ == "__main__":
-    run_pipeline()
+def background_updater():
+    """Atualiza predições em background"""
+    while True:
+        try:
+            collect_and_predict()
+            time.sleep(300)  # 5 minutos
+        except Exception as e:
+            print(f"❌ Erro no background updater: {e}")
+            time.sleep(60)
+
+
+@app.route('/')
+def index():
+    html = r"""
+    <!doctype html>
+    <html lang="pt-br">
+    <head>
+      <meta charset="utf-8" />
+      <meta name="viewport" content="width=device-width, initial-scale=1" />
+      <title>Crypto Trading AI — Dashboard</title>
+      <style>
+        body { margin:0; font-family:sans-serif; background:#0b0b0b; color:#e8e8e8; }
+        .wrap { max-width:1200px; margin:0 auto; padding:20px; }
+        h1 { color:#6ee7ff; }
+        .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:15px; }
+        .card { background:#111214; border:1px solid #2a2c31; border-radius:12px; padding:16px; }
+        .sym { font-weight:bold; font-size:18px; }
+        .price { font-size:20px; margin:8px 0; }
+        .buy { color:#22c55e; } .sell { color:#ef4444; }
+        .confidence { font-size:14px; margin-top:6px; }
+        .muted { color:#9aa0a6; font-size:12px; margin-top:10px; }
+      </style>
+    </head>
+    <body>
+      <div class="wrap">
+        <h1>🚀 Crypto Trading AI</h1>
+        <p>Dashboard em tema Black — sinais em tempo real</p>
+        <div id="signals" class="grid"></div>
+      </div>
+    <script>
+      async function loadPredictions(){
+        const res = await fetch('/api/predictions');
+        const js = await res.json();
+        const div = document.getElementById('signals');
+        div.innerHTML = '';
+        (js.predictions||[]).forEach(p=>{
+          const el = document.createElement('div');
+          el.className='card';
+          el.innerHTML = `
+            <div class="sym">${p.symbol}</div>
+            <div class="price">$${(p.current_price||0).toFixed(4)}</div>
+            <div class="${p.signal==='COMPRA'?'buy':'sell'}">${p.signal} — Confiança ${(p.confidence*100).toFixed(1)}%</div>
+            <div class="confidence">Prob Compra: ${(p.probability_buy*100).toFixed(1)}% | Prob Venda: ${(p.probability_sell*100).toFixed(1)}%</div>
+            <div class="muted">${new Date(p.timestamp).toLocaleString()}</div>
+          `;
+          div.appendChild(el);
+        });
+      }
+      loadPredictions();
+      setInterval(loadPredictions,60000);
+    </script>
+    </body>
+    </html>
+    """
+    return render_template_string(html)
+
+
+@app.route('/api/predictions')
+def get_predictions():
+    global predictions_cache, last_update
+    if not predictions_cache or not last_update or (datetime.now() - last_update).seconds > 300:
+        collect_and_predict()
+    return jsonify({
+        'success': True,
+        'predictions': predictions_cache,
+        'last_update': last_update.isoformat() if last_update else None,
+        'total_signals': len(predictions_cache)
+    })
+
+
+@app.route('/api/status')
+def get_status():
+    return jsonify({
+        'status': 'online',
+        'model_loaded': model is not None,
+        'last_update': last_update.isoformat() if last_update else None,
+        'cached_predictions': len(predictions_cache)
+    })
+
+
+@app.route('/api/force-update')
+def force_update():
+    try:
+        collect_and_predict()
+        return jsonify({
+            'success': True,
+            'message': 'Predições atualizadas',
+            'predictions_count': len(predictions_cache)
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+if __name__ == '__main__':
+    print("🚀 Iniciando Crypto Trading API...")
+    load_ai_model()
+    collect_and_predict()
+    updater_thread = threading.Thread(target=background_updater, daemon=True)
+    updater_thread.start()
+    print("✅ API iniciada com sucesso!")
+
+    # 🚨 Porta dinâmica para Railway
+    port = int(os.environ.get("PORT", 5000))
+    print(f"🌐 Acesse: http://0.0.0.0:{port}")
+    app.run(host="0.0.0.0", port=port, debug=False)
