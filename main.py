@@ -1,27 +1,37 @@
 # -*- coding: utf-8 -*-
 """
 API Flask para Sistema de Trading de Criptomoedas com IA + Alertas Telegram
+- TP/SL por ATR (configurável) com fallback por porcentagem
 """
-import os
-import sys
-import time
-import json
-import threading
-import requests
+import os, sys, time, json, threading, requests
+from math import isnan
 from datetime import datetime, timedelta
+from typing import List, Dict, Any, Tuple
 from flask import Flask, jsonify, render_template_string
 from flask_cors import CORS
 
 # ----------------- Config por ENV -----------------
-ALERT_CONF_MIN = float(os.environ.get("ALERT_CONF_MIN", "0.60"))        # limiar de confiança (0-1)
-ALERT_COOLDOWN_MIN = int(os.environ.get("ALERT_COOLDOWN_MIN", "30"))    # min de silêncio por símbolo
-UPDATE_INTERVAL_SECONDS = int(os.environ.get("UPDATE_INTERVAL_SECONDS", "300"))  # ciclo (seg)
-TP_PCT = float(os.environ.get("TP_PCT", "0.020"))  # alvo +2%
-SL_PCT = float(os.environ.get("SL_PCT", "0.010"))  # stop -1%
-TIMEFRAME = os.environ.get("TIMEFRAME", "H1")
-STRATEGY_LABEL = os.environ.get("STRATEGY_LABEL", "RSI+MACD+EMA+BB")
-TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID")
+ALERT_CONF_MIN        = float(os.environ.get("ALERT_CONF_MIN", "0.60"))       # confiança mínima p/ alertar (0–1)
+ALERT_COOLDOWN_MIN    = int(os.environ.get("ALERT_COOLDOWN_MIN", "30"))       # silêncio por símbolo (min)
+UPDATE_INTERVAL_SEC   = int(os.environ.get("UPDATE_INTERVAL_SECONDS", "300")) # ciclo (s)
+
+# Fallback por % (caso ATR indisponível)
+TP_PCT                = float(os.environ.get("TP_PCT", "0.020"))              # 2%
+SL_PCT                = float(os.environ.get("SL_PCT", "0.010"))              # 1%
+
+# Níveis por ATR
+USE_ATR_LEVELS        = os.environ.get("USE_ATR_LEVELS", "true").lower() in {"1","true","yes","on"}
+ATR_PERIOD            = int(os.environ.get("ATR_PERIOD", "14"))
+TP_ATR_MULT           = float(os.environ.get("TP_ATR_MULT", "2.0"))
+SL_ATR_MULT           = float(os.environ.get("SL_ATR_MULT", "1.0"))
+
+# Rótulos
+TIMEFRAME             = os.environ.get("TIMEFRAME", "H1")
+STRATEGY_LABEL        = os.environ.get("STRATEGY_LABEL", "RSI+MACD+EMA+BB")
+
+# Telegram (fallback HTTP se módulo local não for encontrado)
+TG_TOKEN              = os.environ.get("TELEGRAM_BOT_TOKEN")
+TG_CHAT               = os.environ.get("TELEGRAM_CHAT_ID")
 
 # ----------------- Imports do projeto -----------------
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -72,11 +82,54 @@ def notify_telegram_message(text: str, payload: dict | None = None):
 app = Flask(__name__)
 CORS(app)
 
-predictions_cache = []
-last_update = None
+predictions_cache: List[Dict[str, Any]] = []
+last_update: datetime | None = None
 model = None
 scaler = None
-_last_alert_time = {}  # {symbol: datetime}
+_last_alert_time: Dict[str, datetime] = {}  # {symbol: datetime}
+
+# ----------------- Utils: ATR -----------------
+def _wilder_ema(prev: float, value: float, period: int) -> float:
+    """Wilder EMA para ATR."""
+    return (prev * (period - 1) + value) / period
+
+def compute_atr(candles: List[List[float]], period: int = 14) -> float | None:
+    """
+    candles: [[ts, open, high, low, close], ...] (como o CoinGecko retorna)
+    retorna ATR (float) ou None se não puder calcular
+    """
+    n = len(candles)
+    if n < period + 1:
+        return None
+    trs: List[float] = []
+    for i in range(1, n):
+        _, o, h, l, c = candles[i]
+        _, po, ph, pl, pc = candles[i - 1]
+        tr = max(h - l, abs(h - pc), abs(l - pc))
+        trs.append(float(tr))
+    if len(trs) < period:
+        return None
+    # média inicial
+    atr = sum(trs[:period]) / period
+    # suavização de Wilder
+    for tr in trs[period:]:
+        atr = _wilder_ema(atr, tr, period)
+    if atr is None or isnan(atr):
+        return None
+    return float(atr)
+
+def price_levels_by_atr(side: str, price: float, atr: float,
+                        tp_mult: float, sl_mult: float) -> Tuple[float, float]:
+    """
+    Retorna (tp, sl) a partir do preço e ATR.
+    """
+    if side == "COMPRA":
+        tp = price + tp_mult * atr
+        sl = price - sl_mult * atr
+    else:  # VENDA
+        tp = price - tp_mult * atr
+        sl = price + sl_mult * atr
+    return tp, sl
 
 # ----------------- IA -----------------
 def load_ai_model():
@@ -99,31 +152,34 @@ def collect_and_predict():
     try:
         print("🔄 Coletando dados e fazendo predições...")
         bulk_data = fetch_bulk_prices(SYMBOLS)  # preços, mcap, 24h
-        predictions = []
+        predictions: List[Dict[str, Any]] = []
 
         for symbol in SYMBOLS:
             try:
                 coin_id = SYMBOL_TO_ID.get(symbol, symbol.replace("USDT", "").lower())
-                ohlc_data = fetch_ohlc(coin_id, days=30)
-                if not ohlc_data or len(ohlc_data) < 60:
+                ohlc_raw = fetch_ohlc(coin_id, days=30)  # [[ts, o, h, l, c], ...]
+                if not ohlc_raw or len(ohlc_raw) < 60:
                     continue
 
-                candles = []
-                for ts, o, h, l, c in ohlc_data:
-                    candles.append({
+                # normaliza para predict_signal
+                candles_norm = []
+                for ts, o, h, l, c in ohlc_raw:
+                    candles_norm.append({
                         "timestamp": int(ts/1000),
                         "open": float(o), "high": float(h),
                         "low": float(l), "close": float(c)
                     })
 
-                result, error = predict_signal(symbol, candles)
+                result, error = predict_signal(symbol, candles_norm)
                 if not result:
                     continue
 
                 cur = bulk_data.get(symbol, {})
+                price_now = float(cur.get("usd", 0.0))
+                pct24 = float(cur.get("usd_24h_change", 0.0))
                 result.update({
-                    "current_price": cur.get("usd", 0.0),
-                    "price_change_24h": cur.get("usd_24h_change", 0.0),
+                    "current_price": price_now,
+                    "price_change_24h": pct24,
                     "market_cap": cur.get("usd_market_cap", 0.0)
                 })
                 predictions.append(result)
@@ -139,22 +195,32 @@ def collect_and_predict():
                     ((side == "COMPRA" and prob_buy >= ALERT_CONF_MIN) or
                      (side == "VENDA"  and prob_sell >= ALERT_CONF_MIN))
                 )
+
                 if trigger:
                     now = datetime.utcnow()
                     last = _last_alert_time.get(symbol)
                     if (not last) or ((now - last) >= timedelta(minutes=ALERT_COOLDOWN_MIN)):
-                        price = float(result.get("current_price") or 0.0)
-                        pct24 = float(result.get("price_change_24h") or 0.0)
+                        entry = price_now
+
+                        # ——— níveis por ATR (ou % fallback) ———
+                        tp, sl, rr = None, None, None
+                        if USE_ATR_LEVELS:
+                            atr = compute_atr(ohlc_raw, ATR_PERIOD)
+                            if atr:
+                                tp, sl = price_levels_by_atr(side, entry, atr, TP_ATR_MULT, SL_ATR_MULT)
+                        if tp is None or sl is None:
+                            # fallback por porcentagem
+                            if side == "COMPRA":
+                                tp = entry * (1 + TP_PCT)
+                                sl = entry * (1 - SL_PCT)
+                            else:
+                                tp = entry * (1 - TP_PCT)
+                                sl = entry * (1 + SL_PCT)
+
                         if side == "COMPRA":
-                            entry = price
-                            tp = price * (1 + TP_PCT)
-                            sl = price * (1 - SL_PCT)
-                            rr = (tp - entry) / (entry - sl) if (entry - sl) > 0 else None
-                        else:  # VENDA
-                            entry = price
-                            tp = price * (1 - TP_PCT)
-                            sl = price * (1 + SL_PCT)
-                            rr = (entry - tp) / (sl - entry) if (sl - entry) > 0 else None
+                            rr = (tp - entry) / max(entry - sl, 1e-12)
+                        else:
+                            rr = (entry - tp) / max(sl - entry, 1e-12)
 
                         content = {
                             "symbol": symbol,
@@ -167,12 +233,12 @@ def collect_and_predict():
                             "tp": round(tp, 6),
                             "stop_loss": round(sl, 6),
                             "sl": round(sl, 6),
-                            "current_price": round(price, 6),
+                            "current_price": round(price_now, 6),
                             "confidence": conf,
                             "probability_buy": prob_buy,
                             "probability_sell": prob_sell,
                             "price_change_24h": pct24,
-                            "rr": (round(rr, 2) if rr is not None else None),
+                            "rr": round(rr, 2) if rr == rr else None,  # evita NaN
                             "timestamp": now.isoformat() + "Z"
                         }
 
@@ -182,7 +248,8 @@ def collect_and_predict():
                             f"🎯 Alvo:   {content['tp']}\n"
                             f"🛑 Stop:   {content['sl']}\n"
                             f"📈 Confiança: {conf*100:.0f}%\n"
-                            f"🧠 Estratégia: {STRATEGY_LABEL}\n"
+                            f"🧠 Estratégia: {STRATEGY_LABEL} "
+                            f"{'(ATR)' if USE_ATR_LEVELS else '(%)'}\n"
                             f"⏱️ {TIMEFRAME} • RR: {content['rr'] if content['rr'] is not None else '—'}"
                         )
                         notify_telegram_message(txt, payload=content)
@@ -205,7 +272,7 @@ def background_updater():
             collect_and_predict()
         except Exception as e:
             print(f"❌ Erro no updater: {e}")
-        time.sleep(UPDATE_INTERVAL_SECONDS)
+        time.sleep(UPDATE_INTERVAL_SEC)
 
 # ----------------- Views -----------------
 @app.route("/")
@@ -323,7 +390,7 @@ pullStatus(); pull(); setInterval(()=>{ pullStatus(); pull(); }, 60000);
 @app.route("/api/predictions")
 def get_predictions():
     global predictions_cache, last_update
-    if not predictions_cache or not last_update or (datetime.utcnow() - last_update).seconds > UPDATE_INTERVAL_SECONDS:
+    if not predictions_cache or not last_update or (datetime.utcnow() - last_update).seconds > UPDATE_INTERVAL_SEC:
         collect_and_predict()
     return jsonify({
         "success": True,
@@ -340,7 +407,11 @@ def get_status():
         "last_update": last_update.isoformat() if last_update else None,
         "cached_predictions": len(predictions_cache),
         "alert_conf_min": ALERT_CONF_MIN,
-        "alert_cooldown_min": ALERT_COOLDOWN_MIN
+        "alert_cooldown_min": ALERT_COOLDOWN_MIN,
+        "use_atr_levels": USE_ATR_LEVELS,
+        "atr_period": ATR_PERIOD,
+        "tp_atr_mult": TP_ATR_MULT,
+        "sl_atr_mult": SL_ATR_MULT
     })
 
 @app.route("/api/force-update")
