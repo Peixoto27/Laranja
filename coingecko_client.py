@@ -1,196 +1,101 @@
 # -*- coding: utf-8 -*-
 """
-Cliente CoinGecko com retry/backoff e chamadas em lote para evitar 429.
-- fetch_bulk_prices: preços/24h em batches (default 5) com retry e jitter
-- fetch_ohlc: OHLC com retry e respeito a Retry-After
-
-Leitura de configs opcionais de config.py:
-  API_DELAY_BULK, API_DELAY_OHLC, MAX_RETRIES, BACKOFF_BASE
+coingecko_client.py
+Coleta preços e OHLC do Coingecko com backoff e limites.
 """
 
-from __future__ import annotations
 import time
-import random
+import math
 import requests
-from typing import List, Dict, Any
+from typing import Dict, List, Tuple
 
-# ---- Config (com defaults) ----
-try:
-    from config import API_DELAY_BULK, API_DELAY_OHLC, MAX_RETRIES, BACKOFF_BASE
-except Exception:
-    API_DELAY_BULK = 1.5
-    API_DELAY_OHLC = 1.5
-    MAX_RETRIES = 5
-    BACKOFF_BASE = 1.8
+BASE = "https://api.coingecko.com/api/v3"
 
-# ---- Mapa TICKER -> CoinGecko ID ----
+# Mapeamento rápido de symbols USDT -> id no Coingecko
 SYMBOL_TO_ID: Dict[str, str] = {
     "BTCUSDT": "bitcoin",
     "ETHUSDT": "ethereum",
     "BNBUSDT": "binancecoin",
     "XRPUSDT": "ripple",
-    "ADAUSDT": "cardano",
     "DOGEUSDT": "dogecoin",
     "SOLUSDT": "solana",
     "MATICUSDT": "matic-network",
     "DOTUSDT": "polkadot",
     "LTCUSDT": "litecoin",
     "LINKUSDT": "chainlink",
-    "TRXUSDT": "tron",
-    "FILUSDT": "filecoin",
-    "ATOMUSDT": "cosmos",
-    "AVAXUSDT": "avalanche-2",
-    "XLMUSDT": "stellar",
-    "APTUSDT": "aptos",
-    "INJUSDT": "injective-protocol",
-    "ARBUSDT": "arbitrum",
-    "OPUSDT": "optimism",
-    "SUIUSDT": "sui",
-    "PEPEUSDT": "pepe",
-    "SHIBUSDT": "shiba-inu",
-    "ETCUSDT": "ethereum-classic",
-    "NEARUSDT": "near",
-    "AAVEUSDT": "aave",
-    "UNIUSDT": "uniswap",
-    "XTZUSDT": "tezos",
-    "ICPUSDT": "internet-computer",
-    "FTMUSDT": "fantom",
-    "GRTUSDT": "the-graph",
-    "EGLDUSDT": "multiversx",
-    "CHZUSDT": "chiliz",
-    "ALGOUSDT": "algorand",
-    "SANDUSDT": "the-sandbox",
-    "MANAUSDT": "decentraland",
-    "IMXUSDT": "immutable-x",
-    "RUNEUSDT": "thorchain",
-    "RNDRUSDT": "render-token",
-    "TIAUSDT": "celestia",
-    "JUPUSDT": "jupiter-exchange-solana",
-    "PYTHUSDT": "pyth-network",
 }
 
-API_BASE = "https://api.coingecko.com/api/v3"
-
-session = requests.Session()
-session.headers.update({"User-Agent": "CryptonSignals/1.0 (Railway)"})
-
-
-def _to_cg_id(sym_or_id: str) -> str:
-    if not sym_or_id:
-        return ""
-    s = sym_or_id.strip().upper()
-    if s in SYMBOL_TO_ID:
-        return SYMBOL_TO_ID[s]
-    if s.endswith("USDT") or s.endswith("USDC"):
-        s = s[:-4]
-    return s.lower()
-
-
-def fetch_bulk_prices(symbols: List[str], batch_size: int = 5) -> Dict[str, Any]:
-    """
-    Busca preços e variação 24h para uma lista de símbolos.
-    Faz chamadas em lotes de 'batch_size' (default 5) com retry/backoff.
-    Retorna dict usando TICKERS originais como chaves.
-    """
-    out: Dict[str, Any] = {}
-    if not symbols:
-        return out
-
-    url = f"{API_BASE}/simple/price"
-
-    for i in range(0, len(symbols), batch_size):
-        batch = symbols[i:i + batch_size]
-        ids = ",".join(_to_cg_id(s) for s in batch)
-        params = {"ids": ids, "vs_currencies": "usd", "include_24hr_change": "true"}
-
-        delay = API_DELAY_BULK
-        for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                time.sleep(delay)
-                resp = session.get(url, params=params, timeout=20)
-
-                if resp.status_code == 200:
-                    data = resp.json()
-                    for s in batch:
-                        cid = _to_cg_id(s)
-                        if cid in data:
-                            out[s] = data[cid]
-                    time.sleep(API_DELAY_BULK + random.uniform(0.4, 1.2))
-                    break
-
-                if resp.status_code == 429:
-                    retry_after = resp.headers.get("Retry-After")
-                    wait = float(retry_after) if retry_after else delay
-                    wait += random.uniform(0.8, 2.0)
-                    print(f"⚠️ 429 PRICE ids={ids[:60]}... aguardando {round(wait,1)}s "
-                          f"(tentativa {attempt}/{MAX_RETRIES})")
-                    time.sleep(wait)
-                    delay = min(delay * BACKOFF_BASE, 60.0)
-                    continue
-
-                if 500 <= resp.status_code < 600:
-                    wait = delay + random.uniform(0.8, 2.0)
-                    print(f"⚠️ {resp.status_code} PRICE ids={ids[:60]}... aguardando {round(wait,1)}s")
-                    time.sleep(wait)
-                    delay = min(delay * BACKOFF_BASE, 60.0)
-                    continue
-
-                resp.raise_for_status()
-
-            except requests.RequestException as e:
-                wait = delay + random.uniform(0.8, 2.0)
-                print(f"⚠️ Erro PRICE ids={ids[:60]}...: {e} "
-                      f"(tentativa {attempt}/{MAX_RETRIES}). Aguardando {round(wait,1)}s")
+def _get_json(url: str, params: dict | None = None, retries: int = 6, base_delay: float = 0.8):
+    """GET com backoff para lidar com 429/5xx."""
+    for i in range(1, retries + 1):
+        try:
+            r = requests.get(url, params=params, timeout=20)
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code == 429:
+                # respeita "Retry-After" se vier
+                ra = r.headers.get("Retry-After")
+                wait = float(ra) if ra else base_delay * (1.6 ** (i - 1))
+                print(f"⚠️ 429 {url} — aguardando {wait:.1f}s (tentativa {i}/{retries})")
                 time.sleep(wait)
-                delay = min(delay * BACKOFF_BASE, 60.0)
-        else:
-            print(f"⛔ Falha PRICE ids={ids[:60]}... após {MAX_RETRIES} tentativas; seguindo.")
+                continue
+            # outros 5xx: backoff
+            if 500 <= r.status_code < 600:
+                wait = base_delay * (1.6 ** (i - 1))
+                print(f"⚠️ {r.status_code} {url} — aguardando {wait:.1f}s (tentativa {i}/{retries})")
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+        except requests.RequestException as e:
+            wait = base_delay * (1.6 ** (i - 1))
+            print(f"⚠️ erro de rede {e} — aguardando {wait:.1f}s (tentativa {i}/{retries})")
+            time.sleep(wait)
+    raise RuntimeError(f"Falha ao obter {url} depois de {retries} tentativas")
 
+def chunked(lst: List[str], n: int) -> List[List[str]]:
+    return [lst[i:i+n] for i in range(0, len(lst), n)]
+
+def fetch_bulk_prices(symbols: List[str]) -> Dict[str, Dict]:
+    """
+    Retorna dict:
+      { "BTCUSDT": {"usd": 110000.0, "usd_24h_change": -2.1, "usd_market_cap": ...}, ... }
+    Faz chamadas em lotes (até ~120 ids por request).
+    """
+    out: Dict[str, Dict] = {}
+    ids = []
+    sym_by_id: Dict[str, str] = {}
+    for sym in symbols:
+        cid = SYMBOL_TO_ID.get(sym, sym.replace("USDT", "").lower())
+        sym_by_id[cid] = sym
+        ids.append(cid)
+
+    # Coingecko suporta muitos ids; usamos lotes de 100 para sobrar margem.
+    for group in chunked(ids, 100):
+        params = {
+            "ids": ",".join(group),
+            "vs_currencies": "usd",
+            "include_24hr_change": "true",
+            "include_market_cap": "true",
+        }
+        url = f"{BASE}/simple/price"
+        js = _get_json(url, params=params)
+        for cid, data in (js or {}).items():
+            sym = sym_by_id.get(cid)
+            if not sym:
+                continue
+            out[sym] = {
+                "usd": float(data.get("usd", 0.0) or 0.0),
+                "usd_24h_change": float(data.get("usd_24h_change", 0.0) or 0.0),
+                "usd_market_cap": float(data.get("usd_market_cap", 0.0) or 0.0),
+            }
     return out
 
-
-def fetch_ohlc(sym_or_id: str, days: int = 1) -> list:
+def fetch_ohlc(coin_id: str, days: int = 30, vs: str = "usd") -> List[List[float]]:
     """
-    Busca OHLC com retry/backoff. Aceita TICKER (ex.: BTCUSDT) ou ID (ex.: bitcoin).
-    Retorna lista: [[ts, open, high, low, close], ...]
+    OHLC no formato [[ts, open, high, low, close], ...]
+    docs: /coins/{id}/ohlc?vs_currency=usd&days=30
     """
-    coin_id = _to_cg_id(sym_or_id)
-    url = f"{API_BASE}/coins/{coin_id}/ohlc"
-    params = {"vs_currency": "usd", "days": days}
-
-    delay = API_DELAY_OHLC
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            time.sleep(delay)
-            resp = session.get(url, params=params, timeout=25)
-
-            if resp.status_code == 200:
-                return resp.json()
-
-            if resp.status_code == 429:
-                retry_after = resp.headers.get("Retry-After")
-                wait = float(retry_after) if retry_after else delay
-                wait += random.uniform(0.8, 2.0)
-                print(f"⚠️ 429 OHLC {coin_id}: aguardando {round(wait,1)}s "
-                      f"(tentativa {attempt}/{MAX_RETRIES})")
-                time.sleep(wait)
-                delay = min(delay * BACKOFF_BASE, 60.0)
-                continue
-
-            if 500 <= resp.status_code < 600:
-                wait = delay + random.uniform(0.8, 2.0)
-                print(f"⚠️ {resp.status_code} OHLC {coin_id}: aguardando {round(wait,1)}s")
-                time.sleep(wait)
-                delay = min(delay * BACKOFF_BASE, 60.0)
-                continue
-
-            resp.raise_for_status()
-
-        except requests.RequestException as e:
-            wait = delay + random.uniform(0.8, 2.0)
-            print(f"⚠️ Erro OHLC {coin_id}: {e} (tentativa {attempt}/{MAX_RETRIES}). "
-                  f"Aguardando {round(wait,1)}s")
-            time.sleep(wait)
-            delay = min(delay * BACKOFF_BASE, 60.0)
-
-    return []
+    url = f"{BASE}/coins/{coin_id}/ohlc"
+    js = _get_json(url, params={"vs_currency": vs, "days": str(days)})
+    # a API já retorna [timestamp, o, h, l, c]
+    return [[float(a), float(b), float(c), float(d), float(e)] for a, b, c, d, e in (js or [])]
