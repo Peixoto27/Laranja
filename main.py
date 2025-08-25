@@ -5,6 +5,7 @@ API Flask para Sistema de Trading de Criptomoedas com IA + Alertas Telegram
 - Validação de coerência TP/SL (compra: TP>entry & SL<entry | venda: TP<entry & SL>entry)
 - Anti-duplicação (lado+entry+tp+sl) + cooldown + no máximo 1 alerta por símbolo por ciclo
 - Comentário técnico (tendência, MACD, ATR%, 24h, R:R)
+- Mensagens Telegram com HTML (negrito/itálico/monospace) + emojis
 - Endpoint /api/test-ai para diagnóstico
 - Dashboard dark
 """
@@ -47,6 +48,15 @@ try:
 except ImportError as e:
     print(f"❌ Import error: {e}")
 
+# ----------------- Utils: HTML escape para Telegram -----------------
+def html_escape(s: str) -> str:
+    if s is None:
+        return ""
+    return (str(s)
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;"))
+
 # ----------------- Integração Telegram -----------------
 _tg_fn = None
 try:
@@ -60,28 +70,32 @@ except Exception:
         except Exception:
             _tg_fn = None
 
-def _notify_telegram_fallback(text: str):
+def _notify_telegram_fallback(text: str, parse_mode: str = "HTML"):
     if not (TG_TOKEN and TG_CHAT):
         return
     try:
         url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-        data = {"chat_id": TG_CHAT, "text": text, "parse_mode": "Markdown"}
+        data = {"chat_id": TG_CHAT, "text": text, "parse_mode": parse_mode}
         requests.post(url, json=data, timeout=12)
     except Exception as e:
         print(f"⚠️ Telegram fallback erro: {e}")
 
-def notify_telegram_message(text: str, payload: dict | None = None):
+def notify_telegram_message(text: str, payload: dict | None = None, parse_mode: str = "HTML"):
     try:
         if callable(_tg_fn):
             try:
-                _tg_fn(payload or {"text": text})
+                if payload is None:
+                    payload = {"text": text, "parse_mode": parse_mode}
+                else:
+                    payload = {**payload, "text": text, "parse_mode": parse_mode}
+                _tg_fn(payload)
             except TypeError:
                 _tg_fn(text)
         else:
-            _notify_telegram_fallback(text)
+            _notify_telegram_fallback(text, parse_mode=parse_mode)
     except Exception as e:
         print(f"⚠️ erro ao enviar telegram: {e}")
-        _notify_telegram_fallback(text)
+        _notify_telegram_fallback(text, parse_mode=parse_mode)
 
 # ----------------- App e estado -----------------
 app = Flask(__name__)
@@ -163,7 +177,7 @@ def enforce_coherence(side: str, entry: float, tp: float, sl: float) -> Tuple[fl
     Garante consistência:
       - COMPRA: tp > entry e sl < entry
       - VENDA : tp < entry e sl > entry
-    Se necessário, troca tp <-> sl e faz pequenos ajustes pelo fallback %.
+    Se necessário, troca tp <-> sl e aplica pequenos ajustes pelo fallback %.
     """
     if side == "COMPRA":
         if tp <= entry and sl >= entry:
@@ -331,18 +345,35 @@ def collect_and_predict():
                             "timestamp": now.isoformat() + "Z"
                         }
 
-                        txt = (
-                            f"📢 Novo sinal para {symbol}\n"
-                            f"🎯 Entrada: {content['entry_price']}\n"
-                            f"🎯 Alvo:   {content['tp']}   • 🛑 Stop: {content['sl']}\n"
-                            f"📈 Confiança: {conf*100:.0f}% • R:R {content['rr']}\n"
-                            f"🧠 Estratégia: {STRATEGY_LABEL} {'(ATR)' if USE_ATR_LEVELS else '(%)'}\n"
-                            f"📊 Tendência: {trend_txt} • MACD: {macd_txt} • Vol: {vol_txt}"
-                            + (f" ({content['atr_pct']}%)" if content.get('atr_pct') is not None else "")
-                            + f" • 24h: {pct24:+.2f}%\n"
-                            f"⏱️ {TIMEFRAME}"
+                        # ----- Mensagem HTML formatada -----
+                        side_emoji = "🟢" if side == "COMPRA" else "🔴"
+
+                        def fmtnum(x):
+                            try:
+                                return f"{float(x):,.4f}".replace(",", "X").replace(".", ",").replace("X", ".")
+                            except Exception:
+                                return str(x)
+
+                        rr_txt = content.get("rr")
+                        rr_txt = f"{rr_txt:.2f}" if isinstance(rr_txt, (int, float)) else (rr_txt or "—")
+                        atr_extra = f' ({content["atr_pct"]}%)' if content.get("atr_pct") is not None else ""
+
+                        hdr = f'{side_emoji} <b>{html_escape(side)}</b> | <b>{html_escape(symbol)}</b>'
+                        lin1 = f'🎯 <b>Entrada:</b> <code>{html_escape(fmtnum(content["entry_price"]))}</code>'
+                        lin2 = f'🎯 <b>Alvo:</b>    <code>{html_escape(fmtnum(content["tp"]))}</code>'
+                        lin3 = f'🛑 <b>Stop:</b>    <code>{html_escape(fmtnum(content["sl"]))}</code>'
+                        lin4 = f'📈 <b>Confiança:</b> <code>{int(conf*100)}%</code> • <b>R:R</b> <code>{html_escape(rr_txt)}</code>'
+                        lin5 = f'🧠 Estratégia: <i>{html_escape(STRATEGY_LABEL)}</i> {"(ATR)" if USE_ATR_LEVELS else "(%)"}'
+                        lin6 = (
+                            f'📊 <b>Tendência:</b> {html_escape(trend_txt)} • '
+                            f'<b>MACD:</b> {html_escape(macd_txt)} • '
+                            f'<b>Vol:</b> {html_escape(vol_txt)}{html_escape(atr_extra)}'
                         )
-                        notify_telegram_message(txt, payload=content)
+                        lin7 = f'⏱️ {html_escape(TIMEFRAME)} • 24h: <code>{pct24:+.2f}%</code>'
+
+                        txt = "\n".join([hdr, lin1, lin2, lin3, lin4, lin5, lin6, lin7])
+
+                        notify_telegram_message(txt, payload=content, parse_mode="HTML")
                         _last_alert_time[symbol] = now
 
             except Exception as e:
