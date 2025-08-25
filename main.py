@@ -1,15 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-Crypto Trading AI — API Flask + Alertas Telegram
+Crypto Trading AI — API Flask + Alertas Telegram (consolidado)
 
 Recursos:
 - Perfis por ALERT_MODE (conservador/balanceado/agressivo)
 - TP/SL por ATR (fallback %) + validação de coerência
 - Anti-duplicação de alertas (lado+entry+tp+sl) + cooldown + 1 alerta/símbolo/ciclo
 - Mensagens Telegram em HTML (pro | card | compact) com emojis e botões
+- Envio forçado via HTTP (TELEGRAM_FORCE_HTTP) para suportar parse_mode e reply_markup
 - Endpoints: /, /api/predictions, /api/status, /api/force-update, /api/test-ai, /health
 - Dashboard dark
 """
+
 import os, sys, time, json, threading, requests
 from math import isnan
 from datetime import datetime, timedelta
@@ -42,7 +44,7 @@ elif ALERT_MODE == "agressivo":
     TP_ATR_MULT = 2.5
     SL_ATR_MULT = 1.2
 
-# Permite overrides finos por ENV (opcional)
+# Overrides finos
 ALERT_CONF_MIN = float(os.environ.get("ALERT_CONF_MIN", ALERT_CONF_MIN))
 ALERT_COOLDOWN_MIN = int(os.environ.get("ALERT_COOLDOWN_MIN", ALERT_COOLDOWN_MIN))
 UPDATE_INTERVAL_SEC = int(os.environ.get("UPDATE_INTERVAL_SECONDS", UPDATE_INTERVAL_SEC))
@@ -60,8 +62,12 @@ TG_TOKEN       = os.environ.get("TELEGRAM_BOT_TOKEN")
 TG_CHAT        = os.environ.get("TELEGRAM_CHAT_ID")
 
 # Templates / botões
-ALERT_TEMPLATE = os.environ.get("ALERT_TEMPLATE", "pro").lower()  # pro | card | compact
+ALERT_TEMPLATE = os.environ.get("ALERT_TEMPLATE", "card").lower()  # pro | card | compact
 APP_BASE_URL   = os.environ.get("APP_BASE_URL")  # ex: https://seu-projeto.up.railway.app
+TELEGRAM_FORCE_HTTP = os.environ.get("TELEGRAM_FORCE_HTTP", "1").lower() in {"1","true","yes","on"}
+
+# Formatação numérica (padrão: ponto)
+NUMBER_FORMAT = os.environ.get("NUMBER_FORMAT", "dot").lower()  # dot | comma
 
 # ----------------- Imports do projeto -----------------
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -76,10 +82,7 @@ except ImportError as e:
 def html_escape(s: str) -> str:
     if s is None:
         return ""
-    return (str(s)
-            .replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;"))
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
 # ----------------- Integração Telegram -----------------
 _tg_fn = None
@@ -107,20 +110,19 @@ def _notify_telegram_fallback(text: str, parse_mode: str = "HTML", reply_markup:
         print(f"⚠️ Telegram fallback erro: {e}")
 
 def notify_telegram_message(text: str, payload: dict | None = None, parse_mode: str = "HTML", reply_markup: dict | None = None):
+    if TELEGRAM_FORCE_HTTP or not callable(_tg_fn):
+        _notify_telegram_fallback(text, parse_mode=parse_mode, reply_markup=reply_markup)
+        return
     try:
-        if callable(_tg_fn):
-            try:
-                if payload is None:
-                    payload = {"text": text, "parse_mode": parse_mode}
-                else:
-                    payload = {**payload, "text": text, "parse_mode": parse_mode}
-                if reply_markup:
-                    payload["reply_markup"] = reply_markup
-                _tg_fn(payload)
-            except TypeError:
-                _tg_fn(text)
+        if payload is None:
+            payload = {"text": text, "parse_mode": parse_mode}
         else:
-            _notify_telegram_fallback(text, parse_mode=parse_mode, reply_markup=reply_markup)
+            payload = {**payload, "text": text, "parse_mode": parse_mode}
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        _tg_fn(payload)
+    except TypeError:
+        _notify_telegram_fallback(text, parse_mode=parse_mode, reply_markup=reply_markup)
     except Exception as e:
         print(f"⚠️ erro ao enviar telegram: {e}")
         _notify_telegram_fallback(text, parse_mode=parse_mode, reply_markup=reply_markup)
@@ -133,8 +135,8 @@ predictions_cache: List[Dict[str, Any]] = []
 last_update: datetime | None = None
 model = None
 scaler = None
-_last_alert_time: Dict[str, datetime] = {}    # {symbol: datetime}
-_last_alert_sig:  Dict[str, Tuple] = {}       # {symbol: (side, entry, tp, sl)}  -> evita duplicar
+_last_alert_time: Dict[str, datetime] = {}
+_last_alert_sig:  Dict[str, Tuple] = {}
 
 # ----------------- Utils: médias, MACD, ATR -----------------
 def ema(values: List[float], period: int) -> List[float]:
@@ -190,8 +192,7 @@ def compute_atr(candles: List[List[float]], period: int = 14) -> float | None:
     if atr is None or isnan(atr): return None
     return float(atr)
 
-def price_levels_by_atr(side: str, price: float, atr: float,
-                        tp_mult: float, sl_mult: float) -> Tuple[float, float]:
+def price_levels_by_atr(side: str, price: float, atr: float, tp_mult: float, sl_mult: float) -> Tuple[float, float]:
     if side == "COMPRA":
         tp = price + tp_mult * atr
         sl = price - sl_mult * atr
@@ -201,25 +202,17 @@ def price_levels_by_atr(side: str, price: float, atr: float,
     return tp, sl
 
 def enforce_coherence(side: str, entry: float, tp: float, sl: float) -> Tuple[float, float]:
-    """
-    Garante consistência:
-      - COMPRA: tp > entry e sl < entry
-      - VENDA : tp < entry e sl > entry
-    Se necessário, troca tp <-> sl e aplica pequenos ajustes pelo fallback %.
-    """
     if side == "COMPRA":
-        if tp <= entry and sl >= entry:
-            tp, sl = sl, tp
+        if tp <= entry and sl >= entry: tp, sl = sl, tp
         if tp <= entry: tp = entry * (1 + max(TP_PCT, 0.001))
         if sl >= entry: sl = entry * (1 - max(SL_PCT, 0.001))
     else:
-        if tp >= entry and sl <= entry:
-            tp, sl = sl, tp
+        if tp >= entry and sl <= entry: tp, sl = sl, tp
         if tp >= entry: tp = entry * (1 - max(TP_PCT, 0.001))
         if sl <= entry: sl = entry * (1 + max(SL_PCT, 0.001))
     return tp, sl
 
-# ----------------- Templates e botões de alerta -----------------
+# ----------------- Templates e botões -----------------
 def conf_bar(conf: float, steps: int = 10) -> str:
     try:
         n = max(0, min(steps, round(conf * steps)))
@@ -227,9 +220,14 @@ def conf_bar(conf: float, steps: int = 10) -> str:
     except Exception:
         return "—"
 
-def fmtnum(x):
+def fmtnum(x, decs=4):
+    """Formata com PONTO por padrão. Use NUMBER_FORMAT=comma para vírgula."""
     try:
-        return f"{float(x):,.4f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        s = f"{float(x):,.{decs}f}"
+        # s vem tipo '1,234.5678' no locale EN-US
+        if NUMBER_FORMAT == "comma":
+            return s.replace(",", "X").replace(".", ",").replace("X", ".")
+        return s  # dot
     except Exception:
         return str(x)
 
@@ -251,7 +249,7 @@ def build_msg_html(style: str, symbol: str, side: str, conf: float, content: dic
     rr_txt = f"{rr_txt:.2f}" if isinstance(rr_txt, (int, float)) else (rr_txt or "—")
     pct24 = content.get("price_change_24h") or 0.0
     atr_pct = content.get("atr_pct")
-    atr_extra = f" ({atr_pct}%)" if atr_pct is not None else ""
+    atr_extra = f" ({fmtnum(atr_pct,2).rstrip('0').rstrip('.') }%)" if atr_pct is not None else ""
     kb = build_inline_keyboard(symbol)
 
     if style == "compact":
@@ -320,24 +318,21 @@ def load_ai_model():
 
 # ----------------- Predição + Alertas -----------------
 def collect_and_predict():
-    """Coleta dados, gera predições e dispara alertas conforme regra."""
     global predictions_cache, last_update
     try:
         print("🔄 Coletando dados e fazendo predições...")
-        bulk_data = fetch_bulk_prices(SYMBOLS)  # preços, mcap, 24h
+        bulk_data = fetch_bulk_prices(SYMBOLS)
         predictions: List[Dict[str, Any]] = []
-        sent_this_cycle: Set[str] = set()  # garante 1 alerta por símbolo por ciclo
+        sent_this_cycle: Set[str] = set()
 
         for symbol in SYMBOLS:
             try:
                 coin_id = SYMBOL_TO_ID.get(symbol, symbol.replace("USDT", "").lower())
-                ohlc_raw = fetch_ohlc(coin_id, days=30)  # [[ts, o, h, l, c], ...]
+                ohlc_raw = fetch_ohlc(coin_id, days=30)  # [[ts,o,h,l,c],...]
                 if not ohlc_raw or len(ohlc_raw) < 60:
                     continue
 
-                # normaliza para predict_signal + prepara closes para métricas
-                candles_norm = []
-                closes = []
+                candles_norm, closes = [], []
                 for ts, o, h, l, c in ohlc_raw:
                     candles_norm.append({
                         "timestamp": int(ts/1000),
@@ -360,7 +355,6 @@ def collect_and_predict():
                 })
                 predictions.append(result)
 
-                # ===== Regra de ALERTA + payload completo =====
                 conf = float(result.get("confidence") or 0.0)
                 side = (result.get("signal") or "").upper()
                 prob_buy = float(result.get("probability_buy") or 0.0)
@@ -377,7 +371,6 @@ def collect_and_predict():
                     last_t = _last_alert_time.get(symbol)
 
                     entry = price_now
-                    # ——— níveis por ATR (ou % fallback) ———
                     tp, sl = None, None
                     atr = None
                     if USE_ATR_LEVELS:
@@ -386,22 +379,17 @@ def collect_and_predict():
                             tp, sl = price_levels_by_atr(side, entry, atr, TP_ATR_MULT, SL_ATR_MULT)
                     if tp is None or sl is None:
                         if side == "COMPRA":
-                            tp = entry * (1 + TP_PCT)
-                            sl = entry * (1 - SL_PCT)
+                            tp = entry * (1 + TP_PCT); sl = entry * (1 - SL_PCT)
                         else:
-                            tp = entry * (1 - TP_PCT)
-                            sl = entry * (1 + SL_PCT)
+                            tp = entry * (1 - TP_PCT); sl = entry * (1 + SL_PCT)
 
-                    # --------- Validação de coerência ---------
                     tp, sl = enforce_coherence(side, entry, tp, sl)
 
-                    # --------- Métrica R:R ---------
                     if side == "COMPRA":
                         rr = (tp - entry) / max(entry - sl, 1e-12)
                     else:
                         rr = (entry - tp) / max(sl - entry, 1e-12)
 
-                    # --------- Anti-duplicação ---------
                     sig = (side, round(entry,6), round(tp,6), round(sl,6))
                     last_sig = _last_alert_sig.get(symbol)
                     cooldown_ok = (not last_t) or ((now - last_t) >= timedelta(minutes=ALERT_COOLDOWN_MIN))
@@ -410,7 +398,6 @@ def collect_and_predict():
                         _last_alert_sig[symbol] = sig
                         sent_this_cycle.add(symbol)
 
-                        # --------- Comentário técnico ---------
                         trend_txt = "Neutra"
                         vol_txt = "—"
                         atr_pct = None
@@ -458,7 +445,6 @@ def collect_and_predict():
                             "timestamp": now.isoformat() + "Z"
                         }
 
-                        # ----- Mensagem estilizada + botões -----
                         txt, kb = build_msg_html(ALERT_TEMPLATE, symbol, side, conf, content, STRATEGY_LABEL, TIMEFRAME, USE_ATR_LEVELS)
                         notify_telegram_message(txt, payload=content, parse_mode="HTML", reply_markup=kb)
                         _last_alert_time[symbol] = now
@@ -507,7 +493,7 @@ def index():
   .badge{background:#16181b;border:1px solid var(--ring);padding:6px 10px;border-radius:999px;font-size:12px;color:#d7d7d7}
   .grid{display:grid;grid-template-columns:repeat(12,1fr);gap:14px}
   @media (max-width:1100px){.grid{grid-template-columns:repeat(8,1fr)}}
-  @media (max_width:780px){.grid{grid-template-columns:repeat(4,1fr)}}
+  @media (max-width:780px){.grid{grid-template-columns:repeat(4,1fr)}}
   .card{grid-column:span 4;background:linear-gradient(180deg,#0f1012,#0b0c0e);border:1px solid var(--ring);border-radius:14px;padding:14px}
   .sym{font-weight:600} .price{font-size:20px;margin:6px 0} .buy{color:var(--good)} .sell{color:var(--bad)}
   .muted{color:#9aa0a6;font-size:12px;margin-top:8px}
@@ -605,7 +591,9 @@ def get_predictions():
         "success": True,
         "predictions": predictions_cache,
         "last_update": last_update.isoformat() if last_update else None,
-        "total_signals": len(predictions_cache)
+        "total_signals": len(predictions_cache),
+        "alert_template": ALERT_TEMPLATE,
+        "alert_mode": ALERT_MODE
     })
 
 @app.route("/api/status")
@@ -622,7 +610,8 @@ def get_status():
         "tp_atr_mult": TP_ATR_MULT,
         "sl_atr_mult": SL_ATR_MULT,
         "alert_mode": ALERT_MODE,
-        "alert_template": ALERT_TEMPLATE
+        "alert_template": ALERT_TEMPLATE,
+        "number_format": NUMBER_FORMAT
     })
 
 @app.route("/api/force-update")
@@ -635,10 +624,6 @@ def force_update():
 
 @app.route("/api/test-ai")
 def test_ai():
-    """
-    Diagnóstico: roda a IA ao vivo num símbolo (padrão BTCUSDT), sem cache e sem Telegram.
-    Params: symbol (ex.: DOTUSDT), days (ex.: 14)
-    """
     try:
         symbol = (request.args.get("symbol") or "BTCUSDT").upper().strip()
         days = int(request.args.get("days") or 30)
@@ -681,13 +666,21 @@ def test_ai():
 def health():
     return jsonify(ok=True, model_loaded=(model is not None)), 200
 
-# ----------------- Boot -----------------
+# ----------------- Boot (não bloqueante) -----------------
 if __name__ == "__main__":
     print("🚀 Iniciando Crypto Trading API...")
     load_ai_model()
-    collect_and_predict()
+
+    def _kickoff_first_cycle():
+        try:
+            collect_and_predict()
+        except Exception as e:
+            print(f"❌ Erro no primeiro ciclo: {e}")
+
     threading.Thread(target=background_updater, daemon=True).start()
+    threading.Thread(target=_kickoff_first_cycle, daemon=True).start()
+
     print("✅ API iniciada com sucesso!")
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 8080))
     print(f"🌐 Acesse: http://0.0.0.0:{port}")
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
