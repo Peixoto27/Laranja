@@ -3,15 +3,14 @@
 config.py — Símbolos monitorados
 """
 
+# config.py
 SYMBOLS = [
-    "BTCUSDT",
-    "ETHUSDT",
-    "BNBUSDT",
-    "XRPUSDT",
-    "DOGEUSDT",
-    "SOLUSDT",
-    "MATICUSDT",
-    "DOTUSDT",
-    "LTCUSDT",
-    "LINKUSDT",
+    # os que já tinha
+    "BTCUSDT","ETHUSDT","BNBUSDT","XRPUSDT","DOGEUSDT",
+    "SOLUSDT","MATICUSDT","DOTUSDT","LTCUSDT","LINKUSDT",
+
+    # novos exemplos
+    "ADAUSDT","TRXUSDT","SHIBUSDT","AVAXUSDT","TONUSDT",
+    "NEARUSDT","APTUSDT","OPUSDT","ARBUSDT","ATOMUSDT",
+    "SUIUSDT","PEPEUSDT","FTMUSDT","ICPUSDT","ETCUSDT",
 ]
