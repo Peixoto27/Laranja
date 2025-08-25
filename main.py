@@ -12,14 +12,18 @@ from datetime import datetime, timedelta
 from flask import Flask, jsonify, render_template_string
 from flask_cors import CORS
 
-# ---------- Config de alertas via ENV ----------
-ALERT_CONF_MIN = float(os.environ.get("ALERT_CONF_MIN", "0.60"))   # limiar de confiança (0-1)
-ALERT_COOLDOWN_MIN = int(os.environ.get("ALERT_COOLDOWN_MIN", "30"))  # min por símbolo
-UPDATE_INTERVAL_SECONDS = int(os.environ.get("UPDATE_INTERVAL_SECONDS", "300"))  # 5min
+# ----------------- Config por ENV -----------------
+ALERT_CONF_MIN = float(os.environ.get("ALERT_CONF_MIN", "0.60"))        # limiar de confiança (0-1)
+ALERT_COOLDOWN_MIN = int(os.environ.get("ALERT_COOLDOWN_MIN", "30"))    # min de silêncio por símbolo
+UPDATE_INTERVAL_SECONDS = int(os.environ.get("UPDATE_INTERVAL_SECONDS", "300"))  # ciclo (seg)
+TP_PCT = float(os.environ.get("TP_PCT", "0.020"))  # alvo +2%
+SL_PCT = float(os.environ.get("SL_PCT", "0.010"))  # stop -1%
+TIMEFRAME = os.environ.get("TIMEFRAME", "H1")
+STRATEGY_LABEL = os.environ.get("STRATEGY_LABEL", "RSI+MACD+EMA+BB")
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID")
 
-# ---------- Imports do projeto ----------
+# ----------------- Imports do projeto -----------------
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 try:
     from predict_enhanced import predict_signal, load_model_and_scaler
@@ -28,11 +32,10 @@ try:
 except ImportError as e:
     print(f"❌ Import error: {e}")
 
-# ---------- Tentativa de integrar com seus módulos de Telegram ----------
-# tenta vários nomes de função para compatibilidade com seu repo
+# ----------------- Integração Telegram -----------------
 _tg_fn = None
 try:
-    from notifier_telegram import send_signal_notification as _tg_fn  # nome usado em alguns módulos
+    from notifier_telegram import send_signal_notification as _tg_fn
 except Exception:
     try:
         from notifier_telegram import notify_telegram as _tg_fn
@@ -43,43 +46,39 @@ except Exception:
             _tg_fn = None
 
 def _notify_telegram_fallback(text: str):
-    """Fallback direto via HTTP caso nenhum módulo de notificação esteja disponível."""
     if not (TG_TOKEN and TG_CHAT):
         return
     try:
         url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
         data = {"chat_id": TG_CHAT, "text": text, "parse_mode": "Markdown"}
-        requests.post(url, data=data, timeout=10)
+        requests.post(url, json=data, timeout=12)
     except Exception as e:
         print(f"⚠️ Telegram fallback erro: {e}")
 
 def notify_telegram_message(text: str, payload: dict | None = None):
-    """Função única de envio: usa módulo do projeto se existir; senão, fallback HTTP."""
     try:
         if callable(_tg_fn):
-            # muitos projetos esperam dict; se for string, enviamos como 'text'
             try:
                 _tg_fn(payload or {"text": text})
             except TypeError:
-                _tg_fn(text)  # se a assinatura for (str)
+                _tg_fn(text)
         else:
             _notify_telegram_fallback(text)
     except Exception as e:
         print(f"⚠️ erro ao enviar telegram: {e}")
         _notify_telegram_fallback(text)
 
-# ---------- App ----------
+# ----------------- App e estado -----------------
 app = Flask(__name__)
 CORS(app)
 
-# ---------- Estado ----------
 predictions_cache = []
 last_update = None
 model = None
 scaler = None
 _last_alert_time = {}  # {symbol: datetime}
 
-# ---------- IA ----------
+# ----------------- IA -----------------
 def load_ai_model():
     global model, scaler
     try:
@@ -93,7 +92,7 @@ def load_ai_model():
         print(f"❌ Erro ao carregar modelo: {e}")
         return False
 
-# ---------- Predição + Alertas ----------
+# ----------------- Predição + Alertas -----------------
 def collect_and_predict():
     """Coleta dados, gera predições e dispara alertas conforme regra."""
     global predictions_cache, last_update
@@ -109,23 +108,18 @@ def collect_and_predict():
                 if not ohlc_data or len(ohlc_data) < 60:
                     continue
 
-                # normaliza velas no formato esperado por predict_signal
                 candles = []
                 for ts, o, h, l, c in ohlc_data:
                     candles.append({
-                        "timestamp": int(ts / 1000),
-                        "open": float(o),
-                        "high": float(h),
-                        "low": float(l),
-                        "close": float(c)
+                        "timestamp": int(ts/1000),
+                        "open": float(o), "high": float(h),
+                        "low": float(l), "close": float(c)
                     })
 
                 result, error = predict_signal(symbol, candles)
                 if not result:
-                    # print(f"⚠️ {symbol}: {error}")
                     continue
 
-                # agrega dados atuais
                 cur = bulk_data.get(symbol, {})
                 result.update({
                     "current_price": cur.get("usd", 0.0),
@@ -134,36 +128,64 @@ def collect_and_predict():
                 })
                 predictions.append(result)
 
-                # ===== Regras de ALERTA =====
+                # ===== Regra de ALERTA + payload completo =====
                 conf = float(result.get("confidence") or 0.0)
                 side = (result.get("signal") or "").upper()
                 prob_buy = float(result.get("probability_buy") or 0.0)
                 prob_sell = float(result.get("probability_sell") or 0.0)
 
-                # exemplo de regra base (pode ajustar):
                 trigger = (
                     conf >= ALERT_CONF_MIN and
                     ((side == "COMPRA" and prob_buy >= ALERT_CONF_MIN) or
                      (side == "VENDA"  and prob_sell >= ALERT_CONF_MIN))
                 )
-
                 if trigger:
                     now = datetime.utcnow()
                     last = _last_alert_time.get(symbol)
                     if (not last) or ((now - last) >= timedelta(minutes=ALERT_COOLDOWN_MIN)):
-                        price = result.get("current_price")
-                        pct24 = result.get("price_change_24h")
-                        msg = (
-                            f"🚨 *Sinal Forte Detectado*\n"
-                            f"• Par: *{symbol}*\n"
-                            f"• Ação: *{side}*\n"
-                            f"• Confiança: *{conf*100:.0f}%*\n"
-                            f"• Prob Buy/Sell: {prob_buy*100:.0f}% / {prob_sell*100:.0f}%\n"
-                            f"• Preço: ${price:,.4f}\n"
-                            f"• 24h: {pct24:+.2f}%\n"
-                            f"• Hora: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
+                        price = float(result.get("current_price") or 0.0)
+                        pct24 = float(result.get("price_change_24h") or 0.0)
+                        if side == "COMPRA":
+                            entry = price
+                            tp = price * (1 + TP_PCT)
+                            sl = price * (1 - SL_PCT)
+                            rr = (tp - entry) / (entry - sl) if (entry - sl) > 0 else None
+                        else:  # VENDA
+                            entry = price
+                            tp = price * (1 - TP_PCT)
+                            sl = price * (1 + SL_PCT)
+                            rr = (entry - tp) / (sl - entry) if (sl - entry) > 0 else None
+
+                        content = {
+                            "symbol": symbol,
+                            "side": side,
+                            "strategy": STRATEGY_LABEL,
+                            "timeframe": TIMEFRAME,
+                            "entry": round(entry, 6),
+                            "entry_price": round(entry, 6),
+                            "target_price": round(tp, 6),
+                            "tp": round(tp, 6),
+                            "stop_loss": round(sl, 6),
+                            "sl": round(sl, 6),
+                            "current_price": round(price, 6),
+                            "confidence": conf,
+                            "probability_buy": prob_buy,
+                            "probability_sell": prob_sell,
+                            "price_change_24h": pct24,
+                            "rr": (round(rr, 2) if rr is not None else None),
+                            "timestamp": now.isoformat() + "Z"
+                        }
+
+                        txt = (
+                            f"📢 Novo sinal para {symbol}\n"
+                            f"🎯 Entrada: {content['entry_price']}\n"
+                            f"🎯 Alvo:   {content['tp']}\n"
+                            f"🛑 Stop:   {content['sl']}\n"
+                            f"📈 Confiança: {conf*100:.0f}%\n"
+                            f"🧠 Estratégia: {STRATEGY_LABEL}\n"
+                            f"⏱️ {TIMEFRAME} • RR: {content['rr'] if content['rr'] is not None else '—'}"
                         )
-                        notify_telegram_message(msg, payload={"symbol": symbol, "signal": side, "confidence": conf})
+                        notify_telegram_message(txt, payload=content)
                         _last_alert_time[symbol] = now
 
             except Exception as e:
@@ -178,7 +200,6 @@ def collect_and_predict():
         print(f"❌ Erro na coleta/predição: {e}")
 
 def background_updater():
-    """Atualizador periódico."""
     while True:
         try:
             collect_and_predict()
@@ -186,7 +207,7 @@ def background_updater():
             print(f"❌ Erro no updater: {e}")
         time.sleep(UPDATE_INTERVAL_SECONDS)
 
-# ---------- Views ----------
+# ----------------- Views -----------------
 @app.route("/")
 def index():
     html = r"""
@@ -302,7 +323,6 @@ pullStatus(); pull(); setInterval(()=>{ pullStatus(); pull(); }, 60000);
 @app.route("/api/predictions")
 def get_predictions():
     global predictions_cache, last_update
-    # garante cache fresco
     if not predictions_cache or not last_update or (datetime.utcnow() - last_update).seconds > UPDATE_INTERVAL_SECONDS:
         collect_and_predict()
     return jsonify({
@@ -335,7 +355,6 @@ def force_update():
 def health():
     return jsonify(ok=True, model_loaded=(model is not None)), 200
 
-# ---------- Boot ----------
 if __name__ == "__main__":
     print("🚀 Iniciando Crypto Trading API...")
     load_ai_model()
