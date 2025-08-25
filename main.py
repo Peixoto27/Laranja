@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-API Flask para Sistema de Trading de Criptomoedas com IA + Alertas Telegram
-- TP/SL por ATR (config.) com fallback por porcentagem
-- Validação de coerência TP/SL (compra: TP>entry & SL<entry | venda: TP<entry & SL>entry)
-- Anti-duplicação (lado+entry+tp+sl) + cooldown + no máximo 1 alerta por símbolo por ciclo
-- Comentário técnico (tendência, MACD, ATR%, 24h, R:R)
-- Mensagens Telegram com HTML (negrito/itálico/monospace) + emojis
-- Endpoint /api/test-ai para diagnóstico
+Crypto Trading AI — API Flask + Alertas Telegram
+
+Recursos:
+- Perfis por ALERT_MODE (conservador/balanceado/agressivo)
+- TP/SL por ATR (fallback %) + validação de coerência
+- Anti-duplicação de alertas (lado+entry+tp+sl) + cooldown + 1 alerta/símbolo/ciclo
+- Mensagens Telegram em HTML (pro | card | compact) com emojis e botões
+- Endpoints: /, /api/predictions, /api/status, /api/force-update, /api/test-ai, /health
 - Dashboard dark
 """
 import os, sys, time, json, threading, requests
@@ -17,27 +18,50 @@ from flask import Flask, jsonify, render_template_string, request
 from flask_cors import CORS
 
 # ----------------- Config por ENV -----------------
-ALERT_CONF_MIN        = float(os.environ.get("ALERT_CONF_MIN", "0.60"))       # confiança mínima (0–1)
-ALERT_COOLDOWN_MIN    = int(os.environ.get("ALERT_COOLDOWN_MIN", "30"))       # silêncio por símbolo (min)
-UPDATE_INTERVAL_SEC   = int(os.environ.get("UPDATE_INTERVAL_SECONDS", "300")) # ciclo (s)
+ALERT_MODE = os.environ.get("ALERT_MODE", "balanceado").lower()
 
-# Fallback por % (caso ATR indisponível)
-TP_PCT                = float(os.environ.get("TP_PCT", "0.020"))              # 2%
-SL_PCT                = float(os.environ.get("SL_PCT", "0.010"))              # 1%
+# defaults (balanceado)
+ALERT_CONF_MIN = 0.65
+ALERT_COOLDOWN_MIN = 30
+UPDATE_INTERVAL_SEC = 300
+USE_ATR_LEVELS = True
+ATR_PERIOD = 14
+TP_ATR_MULT = 2.0
+SL_ATR_MULT = 1.0
+TP_PCT = 0.02
+SL_PCT = 0.01
 
-# Níveis por ATR
-USE_ATR_LEVELS        = os.environ.get("USE_ATR_LEVELS", "true").lower() in {"1","true","yes","on"}
-ATR_PERIOD            = int(os.environ.get("ATR_PERIOD", "14"))
-TP_ATR_MULT           = float(os.environ.get("TP_ATR_MULT", "2.0"))
-SL_ATR_MULT           = float(os.environ.get("SL_ATR_MULT", "1.0"))
+if ALERT_MODE == "conservador":
+    ALERT_CONF_MIN = 0.75
+    ALERT_COOLDOWN_MIN = 45
+    TP_ATR_MULT = 1.5
+    SL_ATR_MULT = 1.0
+elif ALERT_MODE == "agressivo":
+    ALERT_CONF_MIN = 0.55
+    ALERT_COOLDOWN_MIN = 15
+    TP_ATR_MULT = 2.5
+    SL_ATR_MULT = 1.2
 
-# Rótulos
-TIMEFRAME             = os.environ.get("TIMEFRAME", "H1")
-STRATEGY_LABEL        = os.environ.get("STRATEGY_LABEL", "RSI+MACD+EMA+BB")
+# Permite overrides finos por ENV (opcional)
+ALERT_CONF_MIN = float(os.environ.get("ALERT_CONF_MIN", ALERT_CONF_MIN))
+ALERT_COOLDOWN_MIN = int(os.environ.get("ALERT_COOLDOWN_MIN", ALERT_COOLDOWN_MIN))
+UPDATE_INTERVAL_SEC = int(os.environ.get("UPDATE_INTERVAL_SECONDS", UPDATE_INTERVAL_SEC))
+USE_ATR_LEVELS = os.environ.get("USE_ATR_LEVELS", str(USE_ATR_LEVELS)).lower() in {"1","true","yes","on"}
+ATR_PERIOD = int(os.environ.get("ATR_PERIOD", ATR_PERIOD))
+TP_ATR_MULT = float(os.environ.get("TP_ATR_MULT", TP_ATR_MULT))
+SL_ATR_MULT = float(os.environ.get("SL_ATR_MULT", SL_ATR_MULT))
+TP_PCT = float(os.environ.get("TP_PCT", TP_PCT))
+SL_PCT = float(os.environ.get("SL_PCT", SL_PCT))
 
-# Telegram (fallback HTTP se módulo local não for encontrado)
-TG_TOKEN              = os.environ.get("TELEGRAM_BOT_TOKEN")
-TG_CHAT               = os.environ.get("TELEGRAM_CHAT_ID")
+# Rótulos e integrações
+TIMEFRAME      = os.environ.get("TIMEFRAME", "H1")
+STRATEGY_LABEL = os.environ.get("STRATEGY_LABEL", "RSI+MACD+EMA+BB")
+TG_TOKEN       = os.environ.get("TELEGRAM_BOT_TOKEN")
+TG_CHAT        = os.environ.get("TELEGRAM_CHAT_ID")
+
+# Templates / botões
+ALERT_TEMPLATE = os.environ.get("ALERT_TEMPLATE", "pro").lower()  # pro | card | compact
+APP_BASE_URL   = os.environ.get("APP_BASE_URL")  # ex: https://seu-projeto.up.railway.app
 
 # ----------------- Imports do projeto -----------------
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -70,17 +94,19 @@ except Exception:
         except Exception:
             _tg_fn = None
 
-def _notify_telegram_fallback(text: str, parse_mode: str = "HTML"):
+def _notify_telegram_fallback(text: str, parse_mode: str = "HTML", reply_markup: dict | None = None):
     if not (TG_TOKEN and TG_CHAT):
         return
     try:
         url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
         data = {"chat_id": TG_CHAT, "text": text, "parse_mode": parse_mode}
+        if reply_markup:
+            data["reply_markup"] = reply_markup
         requests.post(url, json=data, timeout=12)
     except Exception as e:
         print(f"⚠️ Telegram fallback erro: {e}")
 
-def notify_telegram_message(text: str, payload: dict | None = None, parse_mode: str = "HTML"):
+def notify_telegram_message(text: str, payload: dict | None = None, parse_mode: str = "HTML", reply_markup: dict | None = None):
     try:
         if callable(_tg_fn):
             try:
@@ -88,14 +114,16 @@ def notify_telegram_message(text: str, payload: dict | None = None, parse_mode: 
                     payload = {"text": text, "parse_mode": parse_mode}
                 else:
                     payload = {**payload, "text": text, "parse_mode": parse_mode}
+                if reply_markup:
+                    payload["reply_markup"] = reply_markup
                 _tg_fn(payload)
             except TypeError:
                 _tg_fn(text)
         else:
-            _notify_telegram_fallback(text, parse_mode=parse_mode)
+            _notify_telegram_fallback(text, parse_mode=parse_mode, reply_markup=reply_markup)
     except Exception as e:
         print(f"⚠️ erro ao enviar telegram: {e}")
-        _notify_telegram_fallback(text, parse_mode=parse_mode)
+        _notify_telegram_fallback(text, parse_mode=parse_mode, reply_markup=reply_markup)
 
 # ----------------- App e estado -----------------
 app = Flask(__name__)
@@ -190,6 +218,91 @@ def enforce_coherence(side: str, entry: float, tp: float, sl: float) -> Tuple[fl
         if tp >= entry: tp = entry * (1 - max(TP_PCT, 0.001))
         if sl <= entry: sl = entry * (1 + max(SL_PCT, 0.001))
     return tp, sl
+
+# ----------------- Templates e botões de alerta -----------------
+def conf_bar(conf: float, steps: int = 10) -> str:
+    try:
+        n = max(0, min(steps, round(conf * steps)))
+        return ("█" * n) + ("░" * (steps - n))
+    except Exception:
+        return "—"
+
+def fmtnum(x):
+    try:
+        return f"{float(x):,.4f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    except Exception:
+        return str(x)
+
+def build_inline_keyboard(symbol: str) -> dict | None:
+    kb = []
+    tv = f"https://www.tradingview.com/symbols/{symbol.replace('USDT','')}USDT/"
+    kb.append([{"text":"📈 TradingView", "url": tv}])
+    if APP_BASE_URL:
+        kb_row = []
+        kb_row.append({"text":"🤖 Testar IA", "url": f"{APP_BASE_URL}/api/test-ai?symbol={symbol}"})
+        kb_row.append({"text":"🔄 Forçar Update", "url": f"{APP_BASE_URL}/api/force-update"})
+        kb.append(kb_row)
+    return {"inline_keyboard": kb} if kb else None
+
+def build_msg_html(style: str, symbol: str, side: str, conf: float, content: dict,
+                   strat_label: str, timeframe: str, use_atr: bool) -> tuple[str, dict | None]:
+    side_emoji = "🟢" if side == "COMPRA" else "🔴"
+    rr_txt = content.get("rr")
+    rr_txt = f"{rr_txt:.2f}" if isinstance(rr_txt, (int, float)) else (rr_txt or "—")
+    pct24 = content.get("price_change_24h") or 0.0
+    atr_pct = content.get("atr_pct")
+    atr_extra = f" ({atr_pct}%)" if atr_pct is not None else ""
+    kb = build_inline_keyboard(symbol)
+
+    if style == "compact":
+        head = f'{side_emoji} <b>{html_escape(side)}</b> | <b>{html_escape(symbol)}</b>\n'
+        table = (
+            "<pre>"
+            f"Entrada  {fmtnum(content['entry_price']).rjust(12)}\n"
+            f"Alvo     {fmtnum(content['tp']).rjust(12)}\n"
+            f"Stop     {fmtnum(content['sl']).rjust(12)}\n"
+            "</pre>"
+        )
+        tail = (
+            f"Conf: <code>{int(conf*100)}%</code> • R:R <code>{html_escape(rr_txt)}</code>\n"
+            f"{'ATR' if use_atr else '%'} • {html_escape(timeframe)} • 24h: <code>{pct24:+.2f}%</code>"
+        )
+        return head + table + tail, kb
+
+    if style == "card":
+        bar = conf_bar(conf)
+        head = f'{side_emoji} <b>{html_escape(side)}</b> | <b>{html_escape(symbol)}</b>\n'
+        barline = f"Confiança: <code>{int(conf*100)}%</code>\n<code>{bar}</code>\n"
+        grid = (
+            "<pre>"
+            f"Entrada   {fmtnum(content['entry_price']).rjust(12)}\n"
+            f"Alvo      {fmtnum(content['tp']).rjust(12)}\n"
+            f"Stop      {fmtnum(content['sl']).rjust(12)}\n"
+            f"R:R       {str(rr_txt).rjust(12)}\n"
+            "</pre>"
+        )
+        tech = (
+            f"📊 Tendência: <b>{html_escape(content['trend'])}</b> • "
+            f"MACD: <b>{html_escape(content['macd_trend'])}</b> • "
+            f"Vol: <b>{html_escape(content['volatility'])}</b>{html_escape(atr_extra)}\n"
+            f"🧠 Estratégia: <i>{html_escape(strat_label)}</i> {'(ATR)' if use_atr else '(%)'}\n"
+            f"⏱️ {html_escape(timeframe)} • 24h: <code>{pct24:+.2f}%</code>"
+        )
+        return head + barline + grid + tech, kb
+
+    # default: pro
+    head = f'{side_emoji} <b>{html_escape(side)}</b> | <b>{html_escape(symbol)}</b>\n'
+    lines = [
+        f'🎯 <b>Entrada:</b> <code>{html_escape(fmtnum(content["entry_price"]))}</code>',
+        f'🎯 <b>Alvo:</b>    <code>{html_escape(fmtnum(content["tp"]))}</code>',
+        f'🛑 <b>Stop:</b>    <code>{html_escape(fmtnum(content["sl"]))}</code>',
+        f'📈 <b>Confiança:</b> <code>{int(conf*100)}%</code> • <b>R:R</b> <code>{html_escape(rr_txt)}</code>',
+        f'🧠 Estratégia: <i>{html_escape(strat_label)}</i> {"(ATR)" if use_atr else "(%)"}',
+        f'📊 <b>Tendência:</b> {html_escape(content["trend"])} • <b>MACD:</b> {html_escape(content["macd_trend"])} • '
+        f'<b>Vol:</b> {html_escape(content["volatility"])}{html_escape(atr_extra)}',
+        f'⏱️ {html_escape(timeframe)} • 24h: <code>{pct24:+.2f}%</code>'
+    ]
+    return head + "\n".join(lines), kb
 
 # ----------------- IA -----------------
 def load_ai_model():
@@ -297,7 +410,7 @@ def collect_and_predict():
                         _last_alert_sig[symbol] = sig
                         sent_this_cycle.add(symbol)
 
-                        # --------- Comentário profissional ---------
+                        # --------- Comentário técnico ---------
                         trend_txt = "Neutra"
                         vol_txt = "—"
                         atr_pct = None
@@ -345,35 +458,9 @@ def collect_and_predict():
                             "timestamp": now.isoformat() + "Z"
                         }
 
-                        # ----- Mensagem HTML formatada -----
-                        side_emoji = "🟢" if side == "COMPRA" else "🔴"
-
-                        def fmtnum(x):
-                            try:
-                                return f"{float(x):,.4f}".replace(",", "X").replace(".", ",").replace("X", ".")
-                            except Exception:
-                                return str(x)
-
-                        rr_txt = content.get("rr")
-                        rr_txt = f"{rr_txt:.2f}" if isinstance(rr_txt, (int, float)) else (rr_txt or "—")
-                        atr_extra = f' ({content["atr_pct"]}%)' if content.get("atr_pct") is not None else ""
-
-                        hdr = f'{side_emoji} <b>{html_escape(side)}</b> | <b>{html_escape(symbol)}</b>'
-                        lin1 = f'🎯 <b>Entrada:</b> <code>{html_escape(fmtnum(content["entry_price"]))}</code>'
-                        lin2 = f'🎯 <b>Alvo:</b>    <code>{html_escape(fmtnum(content["tp"]))}</code>'
-                        lin3 = f'🛑 <b>Stop:</b>    <code>{html_escape(fmtnum(content["sl"]))}</code>'
-                        lin4 = f'📈 <b>Confiança:</b> <code>{int(conf*100)}%</code> • <b>R:R</b> <code>{html_escape(rr_txt)}</code>'
-                        lin5 = f'🧠 Estratégia: <i>{html_escape(STRATEGY_LABEL)}</i> {"(ATR)" if USE_ATR_LEVELS else "(%)"}'
-                        lin6 = (
-                            f'📊 <b>Tendência:</b> {html_escape(trend_txt)} • '
-                            f'<b>MACD:</b> {html_escape(macd_txt)} • '
-                            f'<b>Vol:</b> {html_escape(vol_txt)}{html_escape(atr_extra)}'
-                        )
-                        lin7 = f'⏱️ {html_escape(TIMEFRAME)} • 24h: <code>{pct24:+.2f}%</code>'
-
-                        txt = "\n".join([hdr, lin1, lin2, lin3, lin4, lin5, lin6, lin7])
-
-                        notify_telegram_message(txt, payload=content, parse_mode="HTML")
+                        # ----- Mensagem estilizada + botões -----
+                        txt, kb = build_msg_html(ALERT_TEMPLATE, symbol, side, conf, content, STRATEGY_LABEL, TIMEFRAME, USE_ATR_LEVELS)
+                        notify_telegram_message(txt, payload=content, parse_mode="HTML", reply_markup=kb)
                         _last_alert_time[symbol] = now
 
             except Exception as e:
@@ -420,7 +507,7 @@ def index():
   .badge{background:#16181b;border:1px solid var(--ring);padding:6px 10px;border-radius:999px;font-size:12px;color:#d7d7d7}
   .grid{display:grid;grid-template-columns:repeat(12,1fr);gap:14px}
   @media (max-width:1100px){.grid{grid-template-columns:repeat(8,1fr)}}
-  @media (max-width:780px){.grid{grid-template-columns:repeat(4,1fr)}}
+  @media (max_width:780px){.grid{grid-template-columns:repeat(4,1fr)}}
   .card{grid-column:span 4;background:linear-gradient(180deg,#0f1012,#0b0c0e);border:1px solid var(--ring);border-radius:14px;padding:14px}
   .sym{font-weight:600} .price{font-size:20px;margin:6px 0} .buy{color:var(--good)} .sell{color:var(--bad)}
   .muted{color:#9aa0a6;font-size:12px;margin-top:8px}
@@ -533,7 +620,9 @@ def get_status():
         "use_atr_levels": USE_ATR_LEVELS,
         "atr_period": ATR_PERIOD,
         "tp_atr_mult": TP_ATR_MULT,
-        "sl_atr_mult": SL_ATR_MULT
+        "sl_atr_mult": SL_ATR_MULT,
+        "alert_mode": ALERT_MODE,
+        "alert_template": ALERT_TEMPLATE
     })
 
 @app.route("/api/force-update")
