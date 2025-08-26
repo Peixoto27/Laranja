@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Crypto Trading AI — API Flask + Alertas Telegram (consolidado)
+Crypto Trading AI — API Flask + Alertas Telegram (com cache OHLC, rodízio e anti-burst)
 
 Recursos:
 - Perfis por ALERT_MODE (conservador/balanceado/agressivo)
@@ -10,6 +10,7 @@ Recursos:
 - Envio forçado via HTTP (TELEGRAM_FORCE_HTTP) para suportar parse_mode e reply_markup
 - Endpoints: /, /api/predictions, /api/status, /api/force-update, /api/test-ai, /health
 - Dashboard dark
+- **NOVO**: Cache OHLC com TTL + rodízio de símbolos por ciclo + pausas anti-burst
 """
 
 import os, sys, time, json, threading, requests
@@ -54,6 +55,12 @@ TP_ATR_MULT = float(os.environ.get("TP_ATR_MULT", TP_ATR_MULT))
 SL_ATR_MULT = float(os.environ.get("SL_ATR_MULT", SL_ATR_MULT))
 TP_PCT = float(os.environ.get("TP_PCT", TP_PCT))
 SL_PCT = float(os.environ.get("SL_PCT", SL_PCT))
+
+# Rodízio + cache OHLC
+SYMBOLS_PER_CYCLE = int(os.environ.get("SYMBOLS_PER_CYCLE", 8))
+OHLC_DAYS = int(os.environ.get("OHLC_DAYS", 14))
+OHLC_TTL_SEC = int(os.environ.get("OHLC_TTL_SEC", 900))  # 15 min
+INTER_SYMBOL_SLEEP = float(os.environ.get("INTER_SYMBOL_SLEEP", 0.7))  # pausa entre símbolos (anti-burst)
 
 # Rótulos e integrações
 TIMEFRAME      = os.environ.get("TIMEFRAME", "H1")
@@ -131,12 +138,17 @@ def notify_telegram_message(text: str, payload: dict | None = None, parse_mode: 
 app = Flask(__name__)
 CORS(app)
 
+# cache predições (mantém último valor de todos)
 predictions_cache: List[Dict[str, Any]] = []
 last_update: datetime | None = None
 model = None
 scaler = None
 _last_alert_time: Dict[str, datetime] = {}
 _last_alert_sig:  Dict[str, Tuple] = {}
+
+# cache OHLC
+_ohlc_cache: Dict[str, Dict[str, Any]] = {}
+_cycle_idx = 0  # round-robin
 
 # ----------------- Utils: médias, MACD, ATR -----------------
 def ema(values: List[float], period: int) -> List[float]:
@@ -224,7 +236,6 @@ def fmtnum(x, decs=4):
     """Formata com PONTO por padrão. Use NUMBER_FORMAT=comma para vírgula."""
     try:
         s = f"{float(x):,.{decs}f}"
-        # s vem tipo '1,234.5678' no locale EN-US
         if NUMBER_FORMAT == "comma":
             return s.replace(",", "X").replace(".", ",").replace("X", ".")
         return s  # dot
@@ -316,20 +327,45 @@ def load_ai_model():
         print(f"❌ Erro ao carregar modelo: {e}")
         return False
 
+# ----------------- Cache OHLC -----------------
+def get_ohlc_cached(symbol: str, coin_id: str) -> List[List[float]] | None:
+    now = datetime.utcnow()
+    cached = _ohlc_cache.get(symbol)
+    if cached and (now - cached["ts"]).total_seconds() < OHLC_TTL_SEC:
+        return cached["data"]
+    data = fetch_ohlc(coin_id, days=OHLC_DAYS)
+    if data:
+        _ohlc_cache[symbol] = {"ts": now, "data": data}
+    return data
+
 # ----------------- Predição + Alertas -----------------
 def collect_and_predict():
-    global predictions_cache, last_update
+    global predictions_cache, last_update, _cycle_idx
     try:
         print("🔄 Coletando dados e fazendo predições...")
+
+        # Preço simples em lote para TODOS (barato e rápido)
         bulk_data = fetch_bulk_prices(SYMBOLS)
-        predictions: List[Dict[str, Any]] = []
+
+        # Round-robin: sublista para OHLC/predição (caro)
+        if not SYMBOLS:
+            return
+        start = _cycle_idx * SYMBOLS_PER_CYCLE
+        end = start + SYMBOLS_PER_CYCLE
+        sublist = SYMBOLS[start:end] or SYMBOLS[:SYMBOLS_PER_CYCLE]
+        _cycle_idx = (_cycle_idx + 1) % max(1, (len(SYMBOLS) + SYMBOLS_PER_CYCLE - 1)//SYMBOLS_PER_CYCLE)
+
+        # Mapa atual (preserva últimos resultados dos que não foram analisados neste ciclo)
+        cache_map = {p.get("symbol"): p for p in (predictions_cache or [])}
+
         sent_this_cycle: Set[str] = set()
 
-        for symbol in SYMBOLS:
+        for symbol in sublist:
             try:
                 coin_id = SYMBOL_TO_ID.get(symbol, symbol.replace("USDT", "").lower())
-                ohlc_raw = fetch_ohlc(coin_id, days=30)  # [[ts,o,h,l,c],...]
+                ohlc_raw = get_ohlc_cached(symbol, coin_id)  # cacheado
                 if not ohlc_raw or len(ohlc_raw) < 60:
+                    # mantém último no dashboard, mas não atualiza
                     continue
 
                 candles_norm, closes = [], []
@@ -353,7 +389,9 @@ def collect_and_predict():
                     "price_change_24h": pct24,
                     "market_cap": cur.get("usd_market_cap", 0.0)
                 })
-                predictions.append(result)
+
+                # Atualiza cache do símbolo
+                cache_map[symbol] = result
 
                 conf = float(result.get("confidence") or 0.0)
                 side = (result.get("signal") or "").upper()
@@ -449,13 +487,31 @@ def collect_and_predict():
                         notify_telegram_message(txt, payload=content, parse_mode="HTML", reply_markup=kb)
                         _last_alert_time[symbol] = now
 
+                # pausa anti-burst entre símbolos
+                time.sleep(INTER_SYMBOL_SLEEP)
+
             except Exception as e:
                 print(f"❌ Erro ao processar {symbol}: {e}")
                 continue
 
-        predictions_cache = predictions
+        # reconstrói predictions_cache preservando todos os símbolos já vistos
+        new_list: List[Dict[str, Any]] = []
+        for sym in SYMBOLS:
+            if sym in cache_map:
+                new_list.append(cache_map[sym])
+            else:
+                # se nunca vimos, cria stub com preço atual (para não "sumir" do dashboard)
+                cur = bulk_data.get(sym, {})
+                new_list.append({
+                    "symbol": sym,
+                    "current_price": float(cur.get("usd", 0.0)),
+                    "price_change_24h": float(cur.get("usd_24h_change", 0.0)),
+                    "signal": None, "confidence": 0.0
+                })
+
+        predictions_cache = new_list
         last_update = datetime.utcnow()
-        print(f"✅ Predições atualizadas: {len(predictions)} símbolos")
+        print(f"✅ Predições atualizadas (sublista {len(sublist)}/{len(SYMBOLS)}). Total em cache: {len(predictions_cache)}")
 
     except Exception as e:
         print(f"❌ Erro na coleta/predição: {e}")
@@ -556,13 +612,14 @@ function render(){
     card.innerHTML=`
       <div class="sym">${s.symbol}</div>
       <div class="price">$${fmt(s.current_price, s.current_price>100?2:4)}</div>
-      <div class="${side==='COMPRA'?'buy':'sell'}">${side} • Conf ${( (s.confidence??0)*100 ).toFixed(0)}%</div>
+      <div class="${side==='COMPRA'?'buy':'sell'}">${side||'—'} • Conf ${( (s.confidence??0)*100 ).toFixed(0)}%</div>
       <div>24h: ${pct24>=0?'▲':'▼'} ${fmt(pct24,2)}%</div>
       <div class="meter" style="--p:${(s.confidence??0)}"></div>
       <div class="muted">${lastUpdate? new Date(lastUpdate).toLocaleString(): '—'}</div>
     `;
     grid.appendChild(card);
   });
+  document.getElementById('empty').style.display = data.length? 'none' : 'inline-block';
   badgeCount.textContent=`${data.length} sinais`;
   badgeTime.textContent= lastUpdate? new Date(lastUpdate).toLocaleTimeString() : '—';
 }
@@ -611,7 +668,11 @@ def get_status():
         "sl_atr_mult": SL_ATR_MULT,
         "alert_mode": ALERT_MODE,
         "alert_template": ALERT_TEMPLATE,
-        "number_format": NUMBER_FORMAT
+        "number_format": NUMBER_FORMAT,
+        "symbols_per_cycle": SYMBOLS_PER_CYCLE,
+        "ohlc_days": OHLC_DAYS,
+        "ohlc_ttl_sec": OHLC_TTL_SEC,
+        "inter_symbol_sleep": INTER_SYMBOL_SLEEP
     })
 
 @app.route("/api/force-update")
@@ -626,10 +687,10 @@ def force_update():
 def test_ai():
     try:
         symbol = (request.args.get("symbol") or "BTCUSDT").upper().strip()
-        days = int(request.args.get("days") or 30)
+        days = int(request.args.get("days") or OHLC_DAYS)
 
         coin_id = SYMBOL_TO_ID.get(symbol, symbol.replace("USDT", "").lower())
-        ohlc_raw = fetch_ohlc(coin_id, days=days)
+        ohlc_raw = get_ohlc_cached(symbol, coin_id)
         if not ohlc_raw or len(ohlc_raw) < 20:
             return jsonify({"success": False, "error": f"OHLC insuficiente para {symbol} (days={days})", "symbol": symbol}), 400
 
